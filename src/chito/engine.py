@@ -96,6 +96,8 @@ class RolloutEngine:
         """Wait for exactly ``train_batch_size`` accepted complete groups."""
         async with self._condition:
             while True:
+                if self._state in (_EngineState.CLOSING, _EngineState.CLOSED):
+                    raise EngineClosedError("rollout engine is closed")
                 if self._failure is not None:
                     raise RolloutFailedError(self._failure) from self._failure
                 if len(self._accepted) >= self._config.train_batch_size:
@@ -109,8 +111,6 @@ class RolloutEngine:
                     raise RolloutNotStartedError("call rollout() before next_batch()")
                 if self._state is _EngineState.EXHAUSTED:
                     raise SourceExhaustedError(tuple(self._accepted))
-                if self._state in (_EngineState.CLOSING, _EngineState.CLOSED):
-                    raise EngineClosedError("rollout engine is closed")
                 await self._condition.wait()
 
     async def update_weights(self, update: object) -> int:
@@ -163,7 +163,10 @@ class RolloutEngine:
         if producer is not None and not producer.done():
             producer.cancel()
         if producer is not None:
-            await producer
+            try:
+                await producer
+            except asyncio.CancelledError:
+                pass
 
         try:
             async with self._update_lock:

@@ -16,6 +16,7 @@ test = ["pytest>=8"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
+pythonpath = ["src"]
 testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
