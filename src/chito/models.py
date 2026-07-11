@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 
 def _as_int_tuple(values: tuple[int, ...], name: str) -> tuple[int, ...]:
@@ -21,6 +22,7 @@ class RolloutPrompt:
 
     prompt_id: str
     token_ids: tuple[int, ...]
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.prompt_id:
@@ -28,6 +30,7 @@ class RolloutPrompt:
         object.__setattr__(
             self, "token_ids", _as_int_tuple(self.token_ids, "prompt.token_ids")
         )
+        object.__setattr__(self, "metadata", dict(self.metadata))
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +121,8 @@ class RolloutGroup:
         for sample in samples:
             if sample.reward is None:
                 raise ValueError("every grouped sample must have a reward")
+            if sample.prompt_id != self.prompt.prompt_id:
+                raise ValueError("every grouped sample must match the group prompt_id")
             if sample.policy_version != self.policy_version:
                 raise ValueError("all grouped samples must use the group policy_version")
         object.__setattr__(self, "samples", samples)
