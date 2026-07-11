@@ -202,7 +202,7 @@ class RolloutEngine:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await self._record_failure(exc)
+            await self._record_failure(self._first_exception(exc))
             raise
         finally:
             self._group_slots.release()
@@ -370,8 +370,10 @@ class RolloutEngine:
             raise InvalidRolloutGroupError("sample does not preserve exact prompt tokens")
         if any(sample.loss_mask[:prompt_length]):
             raise InvalidRolloutGroupError("prompt tokens must be masked from loss")
-        if not all(sample.loss_mask[prompt_length:]):
-            raise InvalidRolloutGroupError("generated tokens must be selected for loss")
+        if not any(sample.loss_mask[prompt_length:]):
+            raise InvalidRolloutGroupError(
+                "sample must contain at least one trainable token after the prompt"
+            )
         if require_reward and sample.reward is None:
             raise InvalidRolloutGroupError("accepted samples must contain rewards")
 

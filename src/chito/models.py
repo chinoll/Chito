@@ -162,6 +162,8 @@ class RolloutConfig:
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.group_size < 2:
+            raise ValueError("group_size must be at least 2 for GRPO rollout")
         if self.initial_policy_version < 0:
             raise ValueError("initial_policy_version must be non-negative")
 
