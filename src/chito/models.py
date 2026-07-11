@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from types import MappingProxyType
 
 
 def _as_int_tuple(values: tuple[int, ...], name: str) -> tuple[int, ...]:
@@ -31,7 +30,7 @@ class RolloutPrompt:
         object.__setattr__(
             self, "token_ids", _as_int_tuple(self.token_ids, "prompt.token_ids")
         )
-        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+        object.__setattr__(self, "metadata", dict(self.metadata))
 
 
 @dataclass(frozen=True, slots=True)

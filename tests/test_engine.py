@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 from dataclasses import replace
 
 import pytest
@@ -89,8 +90,10 @@ def test_prompt_metadata_is_copied() -> None:
     prompt = RolloutPrompt("p", (1,), metadata)
     metadata["target"] = 99
     assert prompt.metadata["target"] == 1
-    with pytest.raises(TypeError):
-        prompt.metadata["target"] = 2  # type: ignore[index]
+
+    restored = pickle.loads(pickle.dumps(prompt))
+    assert restored == prompt
+    assert isinstance(restored.metadata, dict)
 
 
 def test_grpo_requires_at_least_two_samples() -> None:
