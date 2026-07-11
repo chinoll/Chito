@@ -9,6 +9,16 @@ from .models import (
     RolloutSample,
     TrainingBatch,
 )
+from .engine import RolloutEngine
+from .errors import (
+    EngineClosedError,
+    InvalidRolloutGroupError,
+    RolloutAlreadyStartedError,
+    RolloutError,
+    RolloutFailedError,
+    RolloutNotStartedError,
+    SourceExhaustedError,
+)
 from .protocols import (
     GroupPostHook,
     InferenceBackend,
@@ -22,16 +32,24 @@ __version__ = "0.1.0"
 
 __all__ = [
     "GroupPostHook",
+    "EngineClosedError",
     "InferenceBackend",
     "InferenceRequest",
     "InferenceResult",
+    "InvalidRolloutGroupError",
     "RewardFunction",
     "RolloutConfig",
     "RolloutContext",
+    "RolloutAlreadyStartedError",
+    "RolloutEngine",
+    "RolloutError",
+    "RolloutFailedError",
     "RolloutGroup",
     "RolloutPrompt",
+    "RolloutNotStartedError",
     "RolloutSample",
     "RolloutWorkflow",
     "SingleTurnWorkflow",
+    "SourceExhaustedError",
     "TrainingBatch",
 ]
