@@ -133,7 +133,7 @@ class RolloutEngine:
                 await self._backend.update_weights(
                     update, new_policy_version=new_policy_version
                 )
-            except Exception:
+            except BaseException:
                 await self._restore_admission_after_update()
                 raise
 

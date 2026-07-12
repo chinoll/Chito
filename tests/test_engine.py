@@ -296,6 +296,38 @@ def test_failed_weight_update_restores_admission_and_version() -> None:
     asyncio.run(scenario())
 
 
+def test_cancelled_weight_update_restores_admission_and_version() -> None:
+    async def scenario() -> None:
+        update_started = asyncio.Event()
+
+        async def block_update(update: object, version: int) -> None:
+            update_started.set()
+            await asyncio.Event().wait()
+
+        backend = FakeInferenceBackend(update_control=block_update)
+        engine = RolloutEngine(
+            backend,
+            SingleTurnWorkflow(),
+            metadata_reward,
+            RolloutConfig(2, 1, 1),
+        )
+
+        update_task = asyncio.create_task(engine.update_weights("cancelled"))
+        await update_started.wait()
+        update_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await update_task
+
+        await engine.rollout(
+            prompts(RolloutPrompt("p", (1,), {"target": 0}))
+        )
+        batch = await asyncio.wait_for(engine.next_batch(), timeout=1.0)
+        assert batch.groups[0].policy_version == 0
+        await engine.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_source_exhaustion_reports_incomplete_batch() -> None:
     async def scenario() -> None:
         engine = RolloutEngine(
