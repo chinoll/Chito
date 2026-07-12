@@ -22,7 +22,7 @@ class VllmWeightUpdate:
     weights: Iterable[tuple[str, torch.Tensor]]
     checkpoint_format: bool = True
     packed: bool = True
-    packed_buffer_size_bytes: int = 256 << 20
+    packed_buffer_size_bytes: int = 512 << 20
 
     def __post_init__(self) -> None:
         weights = tuple(self.weights)
@@ -349,6 +349,13 @@ class VllmBackend:
                 tensor_device_index = tensor.device.index
             elif tensor.device != tensor_device:
                 raise ValueError("all weights must be on the same CUDA device")
+            if update.packed:
+                tensor_size = tensor.numel() * tensor.element_size()
+                if tensor_size > update.packed_buffer_size_bytes:
+                    raise ValueError(
+                        f"packed buffer is smaller than weight {name!r}: "
+                        f"{update.packed_buffer_size_bytes} < {tensor_size} bytes"
+                    )
 
         if tensor_device_index is None:
             raise ValueError("weight CUDA device must have an explicit index")

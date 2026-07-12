@@ -138,7 +138,7 @@ update = VllmWeightUpdate(
     trainer.named_parameters(),
     checkpoint_format=True,
     packed=True,
-    packed_buffer_size_bytes=256 << 20,
+    packed_buffer_size_bytes=512 << 20,
 )
 new_policy_version = await engine.update_weights(update)
 ```
@@ -146,7 +146,9 @@ new_policy_version = await engine.update_weights(update)
 The backend blocks new generation and drains its own active requests, pauses
 vLLM with cache clearing, runs vLLM's init/start/update/finish weight-transfer
 phases, and resumes generation only after the complete update succeeds. Packed
-transfer is enabled by default with a 256 MiB buffer to bound temporary memory.
+transfer is enabled by default with a 512 MiB buffer to bound temporary memory.
+The buffer must be at least as large as the largest individual tensor; the
+backend validates this before pausing generation.
 
 Input validation and transfer initialization failures can be corrected and
 retried. Once pause/start or any later phase fails, the loaded model may contain

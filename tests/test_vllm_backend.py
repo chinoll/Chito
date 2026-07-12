@@ -34,9 +34,24 @@ class FakeDevice:
 
 
 class FakeCudaTensor:
-    def __init__(self, device_index: int = 0, *, is_cuda: bool = True) -> None:
+    def __init__(
+        self,
+        device_index: int = 0,
+        *,
+        is_cuda: bool = True,
+        numel: int = 1,
+        element_size: int = 2,
+    ) -> None:
         self.device = FakeDevice(device_index)
         self.is_cuda = is_cuda
+        self._numel = numel
+        self._element_size = element_size
+
+    def numel(self) -> int:
+        return self._numel
+
+    def element_size(self) -> int:
+        return self._element_size
 
 
 class FakeCudaDeviceContext:
@@ -78,7 +93,7 @@ class FakeIPCUpdateInfo:
 class FakeIPCTrainerSendWeightsArgs:
     send_mode: object
     packed: bool = True
-    packed_buffer_size_bytes: int = 256 << 20
+    packed_buffer_size_bytes: int = 512 << 20
 
 
 class FakeAsyncLLMEngine:
@@ -359,6 +374,10 @@ def test_invalid_weight_tensors_fail_before_pause_and_allow_retry(
                     ("bias", FakeCudaTensor(1)),
                 )
             ),
+            VllmWeightUpdate(
+                (("weight", FakeCudaTensor(numel=1025, element_size=1)),),
+                packed_buffer_size_bytes=1024,
+            ),
         ]
 
         for update in invalid_updates:
@@ -587,7 +606,7 @@ def test_weight_update_materializes_and_validates_weights() -> None:
 
     defaults = VllmWeightUpdate((("weight", object()),))
     assert defaults.packed
-    assert defaults.packed_buffer_size_bytes == 256 << 20
+    assert defaults.packed_buffer_size_bytes == 512 << 20
 
 
 @pytest.mark.parametrize(
