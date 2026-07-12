@@ -7,7 +7,12 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from chito import InferenceRequest, RolloutPrompt, VllmBackend
+from chito import (
+    InferenceRequest,
+    RolloutPrompt,
+    VllmBackend,
+    VllmWeightUpdate,
+)
 
 
 class FakeAsyncEngineArgs:
@@ -106,6 +111,7 @@ def test_backend_uses_token_prompt_and_sampled_logprobs(fake_vllm) -> None:
         assert fake_engine.engine_args.kwargs == {
             "model": "model-id",
             "dtype": "float16",
+            "weight_transfer_config": {"backend": "ipc"},
         }
         assert fake_engine.max_active == 2
         assert [call[0] for call in fake_engine.calls] == [
@@ -169,8 +175,44 @@ def test_chito_import_does_not_import_optional_vllm(monkeypatch) -> None:
         ({"temperature": -0.1}, "temperature must be non-negative"),
         ({"top_p": 0.0}, "top_p must be in the interval"),
         ({"engine_kwargs": {"model": "other"}}, "pass model directly"),
+        (
+            {"engine_kwargs": {"weight_transfer_config": {"backend": "nccl"}}},
+            "manages weight_transfer_config",
+        ),
     ],
 )
 def test_backend_configuration_fails_fast(fake_vllm, kwargs, error) -> None:
     with pytest.raises(ValueError, match=error):
         VllmBackend("model-id", **kwargs)
+
+
+def test_weight_update_materializes_and_validates_weights() -> None:
+    update = VllmWeightUpdate(
+        ((name, object()) for name in ("a", "b")),
+        checkpoint_format=False,
+        packed=True,
+        packed_buffer_size_bytes=1024,
+    )
+
+    assert isinstance(update.weights, tuple)
+    assert [name for name, _tensor in update.weights] == ["a", "b"]
+    assert not update.checkpoint_format
+    assert update.packed
+    assert update.packed_buffer_size_bytes == 1024
+
+
+@pytest.mark.parametrize(
+    ("weights", "kwargs", "error"),
+    [
+        ([], {}, "at least one"),
+        ([("", object())], {}, "non-empty"),
+        ([("a", object()), ("a", object())], {}, "duplicate"),
+        ([("a", object(), object())], {}, r"\(name, tensor\)"),
+        ([("a", object())], {"packed_buffer_size_bytes": 0}, "positive"),
+    ],
+)
+def test_weight_update_configuration_fails_fast(
+    weights, kwargs, error
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=error):
+        VllmWeightUpdate(weights, **kwargs)

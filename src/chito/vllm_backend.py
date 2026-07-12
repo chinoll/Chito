@@ -5,10 +5,52 @@ from __future__ import annotations
 import asyncio
 import itertools
 import uuid
-from collections.abc import Mapping, Sequence
-from typing import Any
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from .models import InferenceRequest, InferenceResult
+
+if TYPE_CHECKING:
+    import torch
+
+
+@dataclass(frozen=True, slots=True)
+class VllmWeightUpdate:
+    """One complete set of trainer tensors for a vLLM IPC update."""
+
+    weights: Iterable[tuple[str, torch.Tensor]]
+    checkpoint_format: bool = True
+    packed: bool = False
+    packed_buffer_size_bytes: int = 1 << 30
+
+    def __post_init__(self) -> None:
+        weights = tuple(self.weights)
+        if not weights:
+            raise ValueError("weights must contain at least one named tensor")
+
+        names: set[str] = set()
+        for item in weights:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise TypeError("weights must contain (name, tensor) tuples")
+            name, _tensor = item
+            if not isinstance(name, str) or not name:
+                raise ValueError("every weight name must be a non-empty string")
+            if name in names:
+                raise ValueError(f"duplicate weight name: {name}")
+            names.add(name)
+
+        if not isinstance(self.checkpoint_format, bool):
+            raise TypeError("checkpoint_format must be a boolean")
+        if not isinstance(self.packed, bool):
+            raise TypeError("packed must be a boolean")
+        size = self.packed_buffer_size_bytes
+        if not isinstance(size, int) or isinstance(size, bool):
+            raise TypeError("packed_buffer_size_bytes must be an integer")
+        if size <= 0:
+            raise ValueError("packed_buffer_size_bytes must be positive")
+
+        object.__setattr__(self, "weights", weights)
 
 
 class VllmBackend:
@@ -41,6 +83,11 @@ class VllmBackend:
         options = dict(engine_kwargs or {})
         if "model" in options:
             raise ValueError("pass model directly instead of through engine_kwargs")
+        if "weight_transfer_config" in options:
+            raise ValueError(
+                "VllmBackend manages weight_transfer_config for its IPC backend"
+            )
+        options["weight_transfer_config"] = {"backend": "ipc"}
 
         try:
             from vllm import (
