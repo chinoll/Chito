@@ -27,7 +27,11 @@ from .protocols import (
     RolloutWorkflow,
 )
 from .workflows import SingleTurnWorkflow
-from .vllm_backend import VllmBackend, VllmWeightUpdate
+from .vllm_backend import (
+    VllmBackend,
+    VllmBackendPoisonedError,
+    VllmWeightUpdate,
+)
 
 __version__ = "0.1.0"
 
@@ -54,5 +58,6 @@ __all__ = [
     "SourceExhaustedError",
     "TrainingBatch",
     "VllmBackend",
+    "VllmBackendPoisonedError",
     "VllmWeightUpdate",
 ]

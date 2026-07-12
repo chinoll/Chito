@@ -6,7 +6,7 @@ import asyncio
 import itertools
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
 from .models import InferenceRequest, InferenceResult
@@ -53,6 +53,17 @@ class VllmWeightUpdate:
         object.__setattr__(self, "weights", weights)
 
 
+class VllmBackendPoisonedError(RuntimeError):
+    """The loaded engine may contain a partial update and must be reloaded."""
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(
+            "VllmBackend is poisoned by a failed weight update; "
+            "close it and load a fresh backend"
+        )
+        self.cause = cause
+
+
 class VllmBackend:
     """Load one model with vLLM's asynchronous Python engine.
 
@@ -96,6 +107,14 @@ class VllmBackend:
                 SamplingParams,
                 TokensPrompt,
             )
+            from vllm.distributed.weight_transfer.base import (
+                WeightTransferInitRequest,
+                WeightTransferUpdateRequest,
+            )
+            from vllm.distributed.weight_transfer.ipc_engine import (
+                IPCTrainerSendWeightsArgs,
+                IPCWeightTransferEngine,
+            )
         except ModuleNotFoundError as exc:
             if exc.name != "vllm":
                 raise
@@ -115,11 +134,19 @@ class VllmBackend:
             detokenize=False,
         )
         self._tokens_prompt = TokensPrompt
+        self._weight_transfer_init_request = WeightTransferInitRequest
+        self._weight_transfer_update_request = WeightTransferUpdateRequest
+        self._ipc_sender_args = IPCTrainerSendWeightsArgs
+        self._ipc_send_weights = IPCWeightTransferEngine.trainer_send_weights
 
         self._request_prefix = f"chito-{uuid.uuid4().hex}"
         self._request_ids = itertools.count()
         self._lifecycle = asyncio.Condition()
+        self._weight_update_lock = asyncio.Lock()
         self._active_requests = 0
+        self._weight_update_in_progress = False
+        self._weight_transfer_initialized = False
+        self._poisoned: BaseException | None = None
         self._closing = False
         self._closed = False
 
@@ -148,11 +175,60 @@ class VllmBackend:
     async def update_weights(
         self, update: object, *, new_policy_version: int
     ) -> None:
-        """V1 does not claim unsupported in-process vLLM weight mutation."""
-        raise NotImplementedError(
-            "VllmBackend does not support dynamic weight updates in V1; "
-            "close it and construct a new backend with the new checkpoint"
-        )
+        """Transfer one complete policy through vLLM's same-host IPC backend."""
+        if not isinstance(update, VllmWeightUpdate):
+            raise TypeError("update must be a VllmWeightUpdate")
+        if not isinstance(new_policy_version, int) or isinstance(
+            new_policy_version, bool
+        ):
+            raise TypeError("new_policy_version must be an integer")
+        if new_policy_version < 0:
+            raise ValueError("new_policy_version must be non-negative")
+
+        async with self._weight_update_lock:
+            await self._begin_weight_update()
+            poison_cause: BaseException | None = None
+            poison_required = True
+            try:
+                await self._engine.pause_generation(mode="wait", clear_cache=True)
+                try:
+                    await self._ensure_weight_transfer_initialized()
+                except BaseException as init_error:
+                    try:
+                        await self._engine.resume_generation()
+                    except BaseException as resume_error:
+                        poison_required = True
+                        raise BaseExceptionGroup(
+                            "weight-transfer initialization and resume failed",
+                            [init_error, resume_error],
+                        ) from init_error
+                    poison_required = False
+                    raise
+
+                await self._engine.start_weight_update(
+                    is_checkpoint_format=update.checkpoint_format
+                )
+                try:
+                    await self._send_weight_tensors(update)
+                except BaseException as transfer_error:
+                    try:
+                        await self._engine.finish_weight_update()
+                    except BaseException as finish_error:
+                        raise BaseExceptionGroup(
+                            "weight transfer and finish both failed",
+                            [transfer_error, finish_error],
+                        ) from transfer_error
+                    raise
+
+                await self._engine.finish_weight_update()
+                await self._engine.resume_generation()
+                poison_required = False
+            except BaseException as exc:
+                if poison_required:
+                    poison_cause = exc
+                raise
+            finally:
+                await self._end_weight_update(poison_cause)
 
     async def aclose(self) -> None:
         """Wait for admitted requests and release vLLM engine resources once."""
@@ -164,7 +240,11 @@ class VllmBackend:
                 return
 
             self._closing = True
-            await self._lifecycle.wait_for(lambda: self._active_requests == 0)
+            self._lifecycle.notify_all()
+            await self._lifecycle.wait_for(
+                lambda: self._active_requests == 0
+                and not self._weight_update_in_progress
+            )
 
         try:
             self._engine.shutdown()
@@ -175,14 +255,88 @@ class VllmBackend:
 
     async def _begin_request(self) -> None:
         async with self._lifecycle:
-            if self._closing or self._closed:
-                raise RuntimeError("VllmBackend is closed")
+            while self._weight_update_in_progress:
+                self._raise_if_unusable()
+                await self._lifecycle.wait()
+            self._raise_if_unusable()
             self._active_requests += 1
 
     async def _finish_request(self) -> None:
         async with self._lifecycle:
             self._active_requests -= 1
             self._lifecycle.notify_all()
+
+    async def _begin_weight_update(self) -> None:
+        async with self._lifecycle:
+            self._raise_if_unusable()
+            self._weight_update_in_progress = True
+            self._lifecycle.notify_all()
+            try:
+                while self._active_requests > 0:
+                    if self._closing:
+                        raise RuntimeError("VllmBackend is closed")
+                    await self._lifecycle.wait()
+            except BaseException:
+                if self._weight_update_in_progress:
+                    self._weight_update_in_progress = False
+                    self._lifecycle.notify_all()
+                raise
+
+    async def _end_weight_update(self, poison_cause: BaseException | None) -> None:
+        async with self._lifecycle:
+            if poison_cause is not None and self._poisoned is None:
+                self._poisoned = poison_cause
+            self._weight_update_in_progress = False
+            self._lifecycle.notify_all()
+
+    async def _ensure_weight_transfer_initialized(self) -> None:
+        if self._weight_transfer_initialized:
+            return
+        request = self._weight_transfer_init_request(init_info={})
+        await self._engine.init_weight_transfer_engine(request)
+        self._weight_transfer_initialized = True
+
+    async def _send_weight_tensors(self, update: VllmWeightUpdate) -> None:
+        loop = asyncio.get_running_loop()
+
+        def send_to_engine(update_info: Any) -> None:
+            request = self._weight_transfer_update_request(
+                update_info=asdict(update_info)
+            )
+            receiver = asyncio.run_coroutine_threadsafe(
+                self._engine.update_weights(request), loop
+            )
+            receiver.result()
+
+        sender_args = self._ipc_sender_args(
+            send_mode=send_to_engine,
+            packed=update.packed,
+            packed_buffer_size_bytes=update.packed_buffer_size_bytes,
+        )
+        sender = asyncio.create_task(
+            asyncio.to_thread(
+                self._ipc_send_weights,
+                iter(update.weights),
+                sender_args,
+            )
+        )
+        try:
+            await asyncio.shield(sender)
+        except asyncio.CancelledError as cancellation:
+            try:
+                await sender
+            except BaseException as sender_error:
+                raise BaseExceptionGroup(
+                    "weight sender failed while update was cancelled",
+                    [cancellation, sender_error],
+                ) from cancellation
+            raise
+
+    def _raise_if_unusable(self) -> None:
+        if self._closing or self._closed:
+            raise RuntimeError("VllmBackend is closed")
+        if self._poisoned is not None:
+            raise VllmBackendPoisonedError(self._poisoned) from self._poisoned
 
     @staticmethod
     def _to_result(output: Any, request: InferenceRequest) -> InferenceResult:
