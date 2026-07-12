@@ -85,18 +85,6 @@ already contains a compatible vLLM build:
 python -m pip install -e '.[vllm]'
 ```
 
-The extra includes Ray because vLLM 0.24's IPC weight-transfer module imports
-it at module load time. `VllmBackend` itself uses the callable, same-process IPC
-transport and does not create Ray actors.
-
-CUDA IPC handles contain Python/PyTorch runtime types that vLLM's AsyncLLM
-process boundary transports through its pickle fallback. Before importing and
-spawning vLLM, `VllmBackend` sets
-`VLLM_ALLOW_INSECURE_SERIALIZATION=1` when it is unset. This is a process-wide
-vLLM setting and must only be used when the trainer and inference processes are
-trusted and local. If the process explicitly sets the variable to another
-value, the backend leaves it unchanged and fails fast.
-
 CUDA wheels must match the installed NVIDIA driver. For example, a separate
 CUDA 12.9 environment can be created with `uv` without embedding any
 machine-specific path in the project:
@@ -109,7 +97,7 @@ uv pip install --python "$VENV_PATH/bin/python" \
 uv pip install --python "$VENV_PATH/bin/python" -e '.[test]'
 ```
 
-The adapter targets vLLM 0.24's asynchronous engine and native weight-transfer
+The adapter targets vLLM 0.24's asynchronous engine and public checkpoint reload
 API. The optional dependency is bounded below by 0.24 and below the next
 unverified 0.25 release.
 
@@ -136,33 +124,29 @@ backend = VllmBackend(
 owns the loaded engine; call `aclose()` directly, or let `RolloutEngine.aclose()`
 close it.
 
-V1 supports synchronous, same-host CUDA IPC weight updates. Trainer tensors
-must all be CUDA tensors on the same device:
+V1 supports synchronous updates from a complete local Hugging Face checkpoint.
+Save each trained policy to a new immutable directory before submitting it:
 
 ```python
 from chito import VllmWeightUpdate
 
 update = VllmWeightUpdate(
-    trainer.named_parameters(),
-    checkpoint_format=True,
-    packed=True,
-    packed_buffer_size_bytes=512 << 20,
+    "/checkpoints/policy-0001",
 )
 new_policy_version = await engine.update_weights(update)
 ```
 
 The backend blocks new generation and drains its own active requests, pauses
-vLLM with cache clearing, runs vLLM's init/start/update/finish weight-transfer
-phases, and resumes generation only after the complete update succeeds. Packed
-transfer is enabled by default with a 512 MiB buffer to bound temporary memory.
-The buffer must be at least as large as the largest individual tensor; the
-backend validates this before pausing generation.
+vLLM with cache clearing, invokes vLLM's public `reload_weights` collective RPC,
+and resumes generation only after every worker has loaded the complete
+checkpoint. The checkpoint path is resolved to an absolute path and must be
+visible to every vLLM worker.
 
-Input validation and transfer initialization failures can be corrected and
-retried. Once pause/start or any later phase fails, the loaded model may contain
-partial weights; the backend becomes poisoned and rejects generation and further
-updates. Close it and load a fresh backend rather than assigning a policy version
-to uncertain weights.
+An invalid or deleted checkpoint directory is rejected before vLLM is paused and
+can be corrected and retried. Once pause, reload, or resume fails, the loaded
+model may contain partial weights; the backend becomes poisoned and rejects
+generation and further updates. Close it and load a fresh backend rather than
+assigning a policy version to uncertain weights.
 
 ## Usage
 
@@ -232,8 +216,8 @@ python -m pytest
 
 The real vLLM integration test is opt-in and is skipped by the command above. It
 loads `Qwen/Qwen2.5-0.5B-Instruct`, verifies exact rollout token IDs and
-logprobs, transfers a zeroed trainer checkpoint over CUDA IPC, and verifies the
-next policy version uses the updated weights:
+logprobs, reloads a zeroed trainer checkpoint from disk, and verifies the next
+policy version uses the updated weights:
 
 ```bash
 CHITO_RUN_VLLM_INTEGRATION=1 \

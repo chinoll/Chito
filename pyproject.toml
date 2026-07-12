@@ -14,7 +14,7 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
-vllm = ["vllm>=0.24,<0.25", "ray>=2.48"]
+vllm = ["vllm>=0.24,<0.25"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

@@ -4,6 +4,7 @@ import asyncio
 import math
 import os
 from collections.abc import Mapping
+from tempfile import TemporaryDirectory
 
 import pytest
 
@@ -108,9 +109,14 @@ def test_qwen_half_billion_model_rollout_and_weight_update() -> None:
                 for parameter in trainer.parameters():
                     parameter.zero_()
 
-            update = VllmWeightUpdate(trainer.named_parameters())
-            assert await engine.update_weights(update) == 1
-            del update, trainer
+            with TemporaryDirectory(prefix="chito-zero-checkpoint-") as path:
+                trainer.save_pretrained(path, safe_serialization=True)
+                del trainer
+                torch.cuda.empty_cache()
+
+                update = VllmWeightUpdate(path)
+                assert await engine.update_weights(update) == 1
+            del update
             torch.cuda.empty_cache()
 
             release_second.set()
