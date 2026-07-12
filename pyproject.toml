@@ -20,6 +20,7 @@ vllm = ["vllm>=0.24,<0.25"]
 addopts = "-q"
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = ["integration: opt-in tests that load external runtimes and models"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
