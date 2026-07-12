@@ -85,6 +85,10 @@ already contains a compatible vLLM build:
 python -m pip install -e '.[vllm]'
 ```
 
+The extra includes Ray because vLLM 0.24's IPC weight-transfer module imports
+it at module load time. `VllmBackend` itself uses the callable, same-process IPC
+transport and does not create Ray actors.
+
 CUDA wheels must match the installed NVIDIA driver. For example, a separate
 CUDA 12.9 environment can be created with `uv` without embedding any
 machine-specific path in the project:
