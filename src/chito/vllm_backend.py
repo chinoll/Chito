@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import os
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -99,6 +100,14 @@ class VllmBackend:
                 "VllmBackend manages weight_transfer_config for its IPC backend"
             )
         options["weight_transfer_config"] = {"backend": "ipc"}
+
+        serialization_flag = "VLLM_ALLOW_INSECURE_SERIALIZATION"
+        configured_serialization = os.environ.setdefault(serialization_flag, "1")
+        if configured_serialization != "1":
+            raise RuntimeError(
+                f"VllmBackend IPC requires {serialization_flag}=1; "
+                "the existing process setting was left unchanged"
+            )
 
         try:
             from vllm import (

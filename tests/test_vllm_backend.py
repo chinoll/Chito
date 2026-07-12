@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import os
 import sys
 import threading
 from dataclasses import dataclass
@@ -204,6 +205,7 @@ class FakeIPCWeightTransferEngine:
 
 @pytest.fixture
 def fake_vllm(monkeypatch):
+    monkeypatch.delenv("VLLM_ALLOW_INSECURE_SERIALIZATION", raising=False)
     module = ModuleType("vllm")
     module.__path__ = []
     module.AsyncEngineArgs = FakeAsyncEngineArgs
@@ -257,6 +259,7 @@ def test_backend_uses_token_prompt_and_sampled_logprobs(fake_vllm) -> None:
             engine_kwargs={"dtype": "float16"},
         )
         fake_engine = FakeAsyncLLMEngine.instance
+        assert os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] == "1"
 
         task_a = asyncio.create_task(backend.generate(request(0)))
         task_b = asyncio.create_task(backend.generate(request(1)))
@@ -588,6 +591,17 @@ def test_chito_import_does_not_import_optional_vllm(monkeypatch) -> None:
 def test_backend_configuration_fails_fast(fake_vllm, kwargs, error) -> None:
     with pytest.raises(ValueError, match=error):
         VllmBackend("model-id", **kwargs)
+
+
+def test_backend_respects_explicit_serialization_opt_out(
+    fake_vllm, monkeypatch
+) -> None:
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0")
+
+    with pytest.raises(RuntimeError, match="requires.*=1"):
+        VllmBackend("model-id")
+
+    assert os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] == "0"
 
 
 def test_weight_update_materializes_and_validates_weights() -> None:

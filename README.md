@@ -89,6 +89,14 @@ The extra includes Ray because vLLM 0.24's IPC weight-transfer module imports
 it at module load time. `VllmBackend` itself uses the callable, same-process IPC
 transport and does not create Ray actors.
 
+CUDA IPC handles contain Python/PyTorch runtime types that vLLM's AsyncLLM
+process boundary transports through its pickle fallback. Before importing and
+spawning vLLM, `VllmBackend` sets
+`VLLM_ALLOW_INSECURE_SERIALIZATION=1` when it is unset. This is a process-wide
+vLLM setting and must only be used when the trainer and inference processes are
+trusted and local. If the process explicitly sets the variable to another
+value, the backend leaves it unchanged and fails fast.
+
 CUDA wheels must match the installed NVIDIA driver. For example, a separate
 CUDA 12.9 environment can be created with `uv` without embedding any
 machine-specific path in the project:
