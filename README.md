@@ -4,8 +4,10 @@
 It overlaps complete-group rollout production with training-batch consumption and
 switches inference weights only at group boundaries.
 
-V1 requires Python 3.11 or newer. It intentionally contains no concrete vLLM or
-SGLang transport; those systems are integrated through `InferenceBackend`.
+V1 requires Python 3.11 or newer. Its optional `VllmBackend` implements the
+`InferenceBackend` boundary with vLLM's asynchronous Python engine. Other
+inference systems can implement the same small protocol without changing the
+rollout engine.
 
 ## Core semantics
 
@@ -74,6 +76,43 @@ Final `RolloutSample` values preserve the exact full token sequence, behavior
 log-probabilities, loss mask, reward, and policy version. Prompt and non-policy
 context tokens may use `loss_mask=False`.
 
+## vLLM backend
+
+Install the optional dependency, or install `chito` into an environment that
+already contains a compatible vLLM build:
+
+```bash
+python -m pip install -e '.[vllm]'
+```
+
+Constructing `VllmBackend` loads the model. Generation passes the exact prompt
+token IDs to vLLM, requests the sampled-token logprob at every generated
+position, and lets vLLM schedule concurrent asynchronous requests:
+
+```python
+from chito import VllmBackend
+
+backend = VllmBackend(
+    "Qwen/Qwen2.5-0.5B-Instruct",
+    max_tokens=64,
+    temperature=0.8,
+    engine_kwargs={
+        "dtype": "float16",
+        "gpu_memory_utilization": 0.8,
+        "max_model_len": 2048,
+    },
+)
+```
+
+`engine_kwargs` are forwarded to vLLM's public `AsyncEngineArgs`. The adapter
+owns the loaded engine; call `aclose()` directly, or let `RolloutEngine.aclose()`
+close it.
+
+V1 deliberately does not pretend to update a live vLLM engine. Calling
+`VllmBackend.update_weights()` raises `NotImplementedError`; close the current
+engine and construct a new backend from the new checkpoint. A later adapter can
+add weight updates once it has a supported, deployment-specific update path.
+
 ## Usage
 
 ```python
@@ -139,3 +178,19 @@ async pytest plugin is required:
 ```bash
 python -m pytest
 ```
+
+The real vLLM smoke test is opt-in and is skipped by the command above. It loads
+`Qwen/Qwen2.5-0.5B-Instruct`, sends two concurrent samples through
+`RolloutEngine`, and verifies one GRPO batch containing exact token IDs and
+finite sampled-token logprobs:
+
+```bash
+CHITO_RUN_VLLM_INTEGRATION=1 \
+  python -m pytest tests/integration/test_vllm_smoke.py -s
+```
+
+The test requires a working CUDA/vLLM environment and either network access or
+a populated model cache. `CHITO_VLLM_MODEL` can select another local path or
+model ID. Memory-related defaults can be overridden with
+`CHITO_VLLM_GPU_MEMORY_UTILIZATION`, `CHITO_VLLM_MAX_MODEL_LEN`, and
+`CHITO_VLLM_MAX_TOKENS`.
