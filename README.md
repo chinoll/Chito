@@ -85,6 +85,23 @@ already contains a compatible vLLM build:
 python -m pip install -e '.[vllm]'
 ```
 
+CUDA wheels must match the installed NVIDIA driver. For example, a separate
+CUDA 12.8 environment can be created with `uv` without embedding any
+machine-specific path in the project:
+
+```bash
+VENV_PATH="${VENV_PATH:-.venv-vllm}"
+uv venv --python 3.12 "$VENV_PATH"
+uv pip install --python "$VENV_PATH/bin/python" \
+  vllm==0.11.2 --torch-backend=cu128
+uv pip install --python "$VENV_PATH/bin/python" -e '.[test]'
+```
+
+The real smoke test has been verified with vLLM 0.11.2, PyTorch 2.9.0/cu128,
+and `Qwen/Qwen2.5-0.5B-Instruct`. The adapter also targets the same public API
+available through vLLM 0.24, and the optional dependency range is bounded below
+by the tested 0.11.2 release and below the next unverified 0.25 release.
+
 Constructing `VllmBackend` loads the model. Generation passes the exact prompt
 token IDs to vLLM, requests the sampled-token logprob at every generated
 position, and lets vLLM schedule concurrent asynchronous requests:
