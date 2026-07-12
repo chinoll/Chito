@@ -205,6 +205,18 @@ If the source or any rollout task fails, `next_batch()` fails immediately rather
 than waiting forever. Closing the engine cancels internal work, wakes blocked
 producers and consumers, and closes the backend exactly once.
 
+## Samples
+
+[`samples/train_grpo.py`](samples/train_grpo.py) is a minimal educational
+clipped-GRPO loop using the current synchronous checkpoint reload flow:
+
+```bash
+python -m pip install -e '.[vllm]'
+python samples/train_grpo.py
+```
+
+On smaller GPUs, lower the sample's `gpu_memory_utilization` setting.
+
 ## Tests
 
 The test suite uses a deterministic fake backend and standard `asyncio.run`, so no
