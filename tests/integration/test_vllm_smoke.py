@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+from collections.abc import Mapping
 
 import pytest
 
@@ -51,11 +52,15 @@ def test_qwen_half_billion_model_rollout_and_weight_update() -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    prompt_ids = tokenizer.apply_chat_template(
+    rendered_prompt = tokenizer.apply_chat_template(
         [{"role": "user", "content": "Reply with one short greeting."}],
         tokenize=True,
         add_generation_prompt=True,
     )
+    if isinstance(rendered_prompt, Mapping):
+        prompt_ids = list(rendered_prompt["input_ids"])
+    else:
+        prompt_ids = rendered_prompt
     assert isinstance(prompt_ids, list)
 
     async def scenario() -> None:
