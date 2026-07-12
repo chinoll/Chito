@@ -150,13 +150,26 @@ class VllmBackend:
             failure: BaseException | None = None
             try:
                 await self._engine.pause_generation(mode="wait", clear_cache=True)
-                await self._engine.collective_rpc(
-                    "reload_weights",
-                    kwargs={
-                        "weights_path": str(checkpoint_path),
-                        "is_checkpoint_format": True,
-                    },
+                reload_task = asyncio.create_task(
+                    self._engine.collective_rpc(
+                        "reload_weights",
+                        kwargs={
+                            "weights_path": str(checkpoint_path),
+                            "is_checkpoint_format": True,
+                        },
+                    )
                 )
+                try:
+                    await asyncio.shield(reload_task)
+                except asyncio.CancelledError as cancellation:
+                    try:
+                        await reload_task
+                    except BaseException as reload_error:
+                        raise BaseExceptionGroup(
+                            "checkpoint reload failed while update was cancelled",
+                            [cancellation, reload_error],
+                        ) from cancellation
+                    raise
                 await self._engine.resume_generation()
             except BaseException as exc:
                 failure = exc
