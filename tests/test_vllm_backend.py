@@ -28,6 +28,36 @@ class FakeSamplingParams:
         self.kwargs = kwargs
 
 
+@dataclass(frozen=True)
+class FakeDevice:
+    index: int
+
+
+class FakeCudaTensor:
+    def __init__(self, device_index: int = 0, *, is_cuda: bool = True) -> None:
+        self.device = FakeDevice(device_index)
+        self.is_cuda = is_cuda
+
+
+class FakeCudaDeviceContext:
+    def __init__(self, device_index: int) -> None:
+        self.device_index = device_index
+
+    def __enter__(self) -> None:
+        FakeCuda.entries.append((self.device_index, threading.get_ident()))
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+
+class FakeCuda:
+    entries: list[tuple[int, int]] = []
+
+    @staticmethod
+    def device(device_index: int) -> FakeCudaDeviceContext:
+        return FakeCudaDeviceContext(device_index)
+
+
 @dataclass
 class FakeWeightTransferInitRequest:
     init_info: dict[str, object]
@@ -47,8 +77,8 @@ class FakeIPCUpdateInfo:
 @dataclass
 class FakeIPCTrainerSendWeightsArgs:
     send_mode: object
-    packed: bool = False
-    packed_buffer_size_bytes: int = 1 << 30
+    packed: bool = True
+    packed_buffer_size_bytes: int = 256 << 20
 
 
 class FakeAsyncLLMEngine:
@@ -176,6 +206,10 @@ def fake_vllm(monkeypatch):
     ipc = ModuleType("vllm.distributed.weight_transfer.ipc_engine")
     ipc.IPCTrainerSendWeightsArgs = FakeIPCTrainerSendWeightsArgs
     ipc.IPCWeightTransferEngine = FakeIPCWeightTransferEngine
+    torch = ModuleType("torch")
+    torch.Tensor = FakeCudaTensor
+    torch.cuda = FakeCuda
+    FakeCuda.entries.clear()
 
     modules = {
         "vllm": module,
@@ -183,6 +217,7 @@ def fake_vllm(monkeypatch):
         "vllm.distributed.weight_transfer": weight_transfer,
         "vllm.distributed.weight_transfer.base": base,
         "vllm.distributed.weight_transfer.ipc_engine": ipc,
+        "torch": torch,
     }
     for name, fake_module in modules.items():
         monkeypatch.setitem(sys.modules, name, fake_module)
@@ -246,7 +281,7 @@ def test_backend_uses_token_prompt_and_sampled_logprobs(fake_vllm) -> None:
 
 def weight_update(**kwargs) -> VllmWeightUpdate:
     return VllmWeightUpdate(
-        (("layer.weight", object()), ("layer.bias", object())),
+        (("layer.weight", FakeCudaTensor(1)), ("layer.bias", FakeCudaTensor(1))),
         **kwargs,
     )
 
@@ -287,6 +322,7 @@ def test_backend_runs_four_phase_weight_update_on_thread(fake_vllm) -> None:
         assert fake_engine.sender_args[0].packed is True
         assert fake_engine.sender_args[0].packed_buffer_size_bytes == 4096
         assert fake_engine.sender_thread_ids[0] != loop_thread_id
+        assert FakeCuda.entries == [(1, fake_engine.sender_thread_ids[0])]
         assert fake_engine.receiver_thread_ids == [loop_thread_id]
         assert fake_engine.update_requests[0].update_info == {
             "names": ["layer.weight", "layer.bias"],
@@ -303,6 +339,35 @@ def test_backend_runs_four_phase_weight_update_on_thread(fake_vllm) -> None:
             "finish",
             "resume",
         ]
+        await backend.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_invalid_weight_tensors_fail_before_pause_and_allow_retry(
+    fake_vllm,
+) -> None:
+    async def scenario() -> None:
+        backend = VllmBackend("model-id")
+        fake_engine = FakeAsyncLLMEngine.instance
+        invalid_updates = [
+            VllmWeightUpdate((("weight", object()),)),
+            VllmWeightUpdate((("weight", FakeCudaTensor(is_cuda=False)),)),
+            VllmWeightUpdate(
+                (
+                    ("weight", FakeCudaTensor(0)),
+                    ("bias", FakeCudaTensor(1)),
+                )
+            ),
+        ]
+
+        for update in invalid_updates:
+            with pytest.raises((TypeError, ValueError)):
+                await backend.update_weights(update, new_policy_version=1)
+        assert fake_engine.events == []
+
+        await backend.update_weights(weight_update(), new_policy_version=1)
+        assert fake_engine.events[0] == "pause"
         await backend.aclose()
 
     asyncio.run(scenario())
@@ -519,6 +584,10 @@ def test_weight_update_materializes_and_validates_weights() -> None:
     assert not update.checkpoint_format
     assert update.packed
     assert update.packed_buffer_size_bytes == 1024
+
+    defaults = VllmWeightUpdate((("weight", object()),))
+    assert defaults.packed
+    assert defaults.packed_buffer_size_bytes == 256 << 20
 
 
 @pytest.mark.parametrize(

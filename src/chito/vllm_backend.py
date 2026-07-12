@@ -21,8 +21,8 @@ class VllmWeightUpdate:
 
     weights: Iterable[tuple[str, torch.Tensor]]
     checkpoint_format: bool = True
-    packed: bool = False
-    packed_buffer_size_bytes: int = 1 << 30
+    packed: bool = True
+    packed_buffer_size_bytes: int = 256 << 20
 
     def __post_init__(self) -> None:
         weights = tuple(self.weights)
@@ -115,6 +115,7 @@ class VllmBackend:
                 IPCTrainerSendWeightsArgs,
                 IPCWeightTransferEngine,
             )
+            import torch
         except ModuleNotFoundError as exc:
             if exc.name != "vllm":
                 raise
@@ -138,6 +139,7 @@ class VllmBackend:
         self._weight_transfer_update_request = WeightTransferUpdateRequest
         self._ipc_sender_args = IPCTrainerSendWeightsArgs
         self._ipc_send_weights = IPCWeightTransferEngine.trainer_send_weights
+        self._torch = torch
 
         self._request_prefix = f"chito-{uuid.uuid4().hex}"
         self._request_ids = itertools.count()
@@ -186,6 +188,7 @@ class VllmBackend:
             raise ValueError("new_policy_version must be non-negative")
 
         async with self._weight_update_lock:
+            tensor_device = self._validate_weight_tensors(update)
             await self._begin_weight_update()
             poison_cause: BaseException | None = None
             poison_required = True
@@ -209,7 +212,7 @@ class VllmBackend:
                     is_checkpoint_format=update.checkpoint_format
                 )
                 try:
-                    await self._send_weight_tensors(update)
+                    await self._send_weight_tensors(update, tensor_device)
                 except BaseException as transfer_error:
                     try:
                         await self._engine.finish_weight_update()
@@ -296,7 +299,9 @@ class VllmBackend:
         await self._engine.init_weight_transfer_engine(request)
         self._weight_transfer_initialized = True
 
-    async def _send_weight_tensors(self, update: VllmWeightUpdate) -> None:
+    async def _send_weight_tensors(
+        self, update: VllmWeightUpdate, tensor_device: int
+    ) -> None:
         loop = asyncio.get_running_loop()
 
         def send_to_engine(update_info: Any) -> None:
@@ -313,13 +318,12 @@ class VllmBackend:
             packed=update.packed,
             packed_buffer_size_bytes=update.packed_buffer_size_bytes,
         )
-        sender = asyncio.create_task(
-            asyncio.to_thread(
-                self._ipc_send_weights,
-                iter(update.weights),
-                sender_args,
-            )
-        )
+
+        def send_from_tensor_device() -> None:
+            with self._torch.cuda.device(tensor_device):
+                self._ipc_send_weights(iter(update.weights), sender_args)
+
+        sender = asyncio.create_task(asyncio.to_thread(send_from_tensor_device))
         try:
             await asyncio.shield(sender)
         except asyncio.CancelledError as cancellation:
@@ -331,6 +335,24 @@ class VllmBackend:
                     [cancellation, sender_error],
                 ) from cancellation
             raise
+
+    def _validate_weight_tensors(self, update: VllmWeightUpdate) -> int:
+        tensor_device = None
+        tensor_device_index: int | None = None
+        for name, tensor in update.weights:
+            if not isinstance(tensor, self._torch.Tensor):
+                raise TypeError(f"weight {name!r} must be a torch.Tensor")
+            if not tensor.is_cuda:
+                raise ValueError(f"weight {name!r} must be on a CUDA device")
+            if tensor_device is None:
+                tensor_device = tensor.device
+                tensor_device_index = tensor.device.index
+            elif tensor.device != tensor_device:
+                raise ValueError("all weights must be on the same CUDA device")
+
+        if tensor_device_index is None:
+            raise ValueError("weight CUDA device must have an explicit index")
+        return tensor_device_index
 
     def _raise_if_unusable(self) -> None:
         if self._closing or self._closed:
