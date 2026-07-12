@@ -86,21 +86,20 @@ python -m pip install -e '.[vllm]'
 ```
 
 CUDA wheels must match the installed NVIDIA driver. For example, a separate
-CUDA 12.8 environment can be created with `uv` without embedding any
+CUDA 12.9 environment can be created with `uv` without embedding any
 machine-specific path in the project:
 
 ```bash
 VENV_PATH="${VENV_PATH:-.venv-vllm}"
 uv venv --python 3.12 "$VENV_PATH"
 uv pip install --python "$VENV_PATH/bin/python" \
-  vllm==0.11.2 --torch-backend=cu128
+  vllm==0.24.0 --torch-backend=cu129
 uv pip install --python "$VENV_PATH/bin/python" -e '.[test]'
 ```
 
-The real smoke test has been verified with vLLM 0.11.2, PyTorch 2.9.0/cu128,
-and `Qwen/Qwen2.5-0.5B-Instruct`. The adapter also targets the same public API
-available through vLLM 0.24, and the optional dependency range is bounded below
-by the tested 0.11.2 release and below the next unverified 0.25 release.
+The adapter targets vLLM 0.24's asynchronous engine and native weight-transfer
+API. The optional dependency is bounded below by 0.24 and below the next
+unverified 0.25 release.
 
 Constructing `VllmBackend` loads the model. Generation passes the exact prompt
 token IDs to vLLM, requests the sampled-token logprob at every generated
@@ -125,10 +124,31 @@ backend = VllmBackend(
 owns the loaded engine; call `aclose()` directly, or let `RolloutEngine.aclose()`
 close it.
 
-V1 deliberately does not pretend to update a live vLLM engine. Calling
-`VllmBackend.update_weights()` raises `NotImplementedError`; close the current
-engine and construct a new backend from the new checkpoint. A later adapter can
-add weight updates once it has a supported, deployment-specific update path.
+V1 supports synchronous, same-host CUDA IPC weight updates. Trainer tensors
+must all be CUDA tensors on the same device:
+
+```python
+from chito import VllmWeightUpdate
+
+update = VllmWeightUpdate(
+    trainer.named_parameters(),
+    checkpoint_format=True,
+    packed=True,
+    packed_buffer_size_bytes=256 << 20,
+)
+new_policy_version = await engine.update_weights(update)
+```
+
+The backend blocks new generation and drains its own active requests, pauses
+vLLM with cache clearing, runs vLLM's init/start/update/finish weight-transfer
+phases, and resumes generation only after the complete update succeeds. Packed
+transfer is enabled by default with a 256 MiB buffer to bound temporary memory.
+
+Input validation and transfer initialization failures can be corrected and
+retried. Once pause/start or any later phase fails, the loaded model may contain
+partial weights; the backend becomes poisoned and rejects generation and further
+updates. Close it and load a fresh backend rather than assigning a policy version
+to uncertain weights.
 
 ## Usage
 
@@ -196,10 +216,10 @@ async pytest plugin is required:
 python -m pytest
 ```
 
-The real vLLM smoke test is opt-in and is skipped by the command above. It loads
-`Qwen/Qwen2.5-0.5B-Instruct`, sends two concurrent samples through
-`RolloutEngine`, and verifies one GRPO batch containing exact token IDs and
-finite sampled-token logprobs:
+The real vLLM integration test is opt-in and is skipped by the command above. It
+loads `Qwen/Qwen2.5-0.5B-Instruct`, verifies exact rollout token IDs and
+logprobs, transfers a zeroed trainer checkpoint over CUDA IPC, and verifies the
+next policy version uses the updated weights:
 
 ```bash
 CHITO_RUN_VLLM_INTEGRATION=1 \
@@ -209,5 +229,4 @@ CHITO_RUN_VLLM_INTEGRATION=1 \
 The test requires a working CUDA/vLLM environment and either network access or
 a populated model cache. `CHITO_VLLM_MODEL` can select another local path or
 model ID. Memory-related defaults can be overridden with
-`CHITO_VLLM_GPU_MEMORY_UTILIZATION`, `CHITO_VLLM_MAX_MODEL_LEN`, and
-`CHITO_VLLM_MAX_TOKENS`.
+`CHITO_VLLM_GPU_MEMORY_UTILIZATION` and `CHITO_VLLM_MAX_MODEL_LEN`.

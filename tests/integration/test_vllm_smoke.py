@@ -13,6 +13,7 @@ from chito import (
     RolloutSample,
     SingleTurnWorkflow,
     VllmBackend,
+    VllmWeightUpdate,
 )
 
 
@@ -31,8 +32,12 @@ pytestmark = [
 ]
 
 
-async def one_prompt(prompt: RolloutPrompt):
-    yield prompt
+async def gated_prompts(
+    prompt_ids: tuple[int, ...], release_second: asyncio.Event
+):
+    yield RolloutPrompt("qwen-before-update", prompt_ids)
+    await release_second.wait()
+    yield RolloutPrompt("qwen-after-update", prompt_ids)
 
 
 async def sample_index_reward(
@@ -41,8 +46,9 @@ async def sample_index_reward(
     return float(sample.sample_index)
 
 
-def test_qwen_half_billion_model_produces_grpo_batch() -> None:
-    from transformers import AutoTokenizer
+def test_qwen_half_billion_model_rollout_and_weight_update() -> None:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     prompt_ids = tokenizer.apply_chat_template(
@@ -55,8 +61,8 @@ def test_qwen_half_billion_model_produces_grpo_batch() -> None:
     async def scenario() -> None:
         backend = VllmBackend(
             MODEL,
-            max_tokens=int(os.environ.get("CHITO_VLLM_MAX_TOKENS", "8")),
-            temperature=0.8,
+            max_tokens=1,
+            temperature=0.0,
             engine_kwargs={
                 "dtype": os.environ.get("CHITO_VLLM_DTYPE", "float16"),
                 "enforce_eager": True,
@@ -80,27 +86,59 @@ def test_qwen_half_billion_model_produces_grpo_batch() -> None:
                 max_concurrent_groups=1,
             ),
         )
-        prompt = RolloutPrompt("qwen-smoke", tuple(prompt_ids))
+        release_second = asyncio.Event()
 
         try:
-            await engine.rollout(one_prompt(prompt))
-            batch = await engine.next_batch()
+            await engine.rollout(
+                gated_prompts(tuple(prompt_ids), release_second)
+            )
+            before_batch = await engine.next_batch()
+
+            trainer = AutoModelForCausalLM.from_pretrained(
+                MODEL,
+                dtype=torch.float16,
+            ).to("cuda:0")
+            trainer.requires_grad_(False)
+            with torch.no_grad():
+                for parameter in trainer.parameters():
+                    parameter.zero_()
+
+            update = VllmWeightUpdate(trainer.named_parameters())
+            assert await engine.update_weights(update) == 1
+            del update, trainer
+            torch.cuda.empty_cache()
+
+            release_second.set()
+            after_batch = await engine.next_batch()
         finally:
             await engine.aclose()
 
-        assert len(batch.groups) == 1
-        group = batch.groups[0]
-        assert len(group.samples) == 2
-        assert {sample.reward for sample in group.samples} == {0.0, 1.0}
-        for sample in group.samples:
-            assert sample.token_ids[: len(prompt_ids)] == tuple(prompt_ids)
-            generated_ids = sample.token_ids[len(prompt_ids) :]
-            generated_logprobs = sample.logprobs[len(prompt_ids) :]
-            assert generated_ids
-            assert len(generated_ids) == len(generated_logprobs)
-            assert all(math.isfinite(value) for value in generated_logprobs)
-            assert sample.loss_mask == (False,) * len(prompt_ids) + (
-                True,
-            ) * len(generated_ids)
+        assert len(before_batch.groups) == len(after_batch.groups) == 1
+        before_group = before_batch.groups[0]
+        after_group = after_batch.groups[0]
+        assert before_group.policy_version == 0
+        assert after_group.policy_version == 1
+
+        before_tokens = _assert_group(before_group.samples, prompt_ids)
+        after_tokens = _assert_group(after_group.samples, prompt_ids)
+        assert all(token_id != 0 for token_id in before_tokens)
+        assert after_tokens == [0, 0]
 
     asyncio.run(scenario())
+
+
+def _assert_group(
+    samples: tuple[RolloutSample, ...], prompt_ids: list[int]
+) -> list[int]:
+    assert len(samples) == 2
+    assert {sample.reward for sample in samples} == {0.0, 1.0}
+    generated_tokens: list[int] = []
+    for sample in samples:
+        assert sample.token_ids[: len(prompt_ids)] == tuple(prompt_ids)
+        generated_ids = sample.token_ids[len(prompt_ids) :]
+        generated_logprobs = sample.logprobs[len(prompt_ids) :]
+        assert len(generated_ids) == len(generated_logprobs) == 1
+        assert math.isfinite(generated_logprobs[0])
+        assert sample.loss_mask == (False,) * len(prompt_ids) + (True,)
+        generated_tokens.append(generated_ids[0])
+    return generated_tokens
