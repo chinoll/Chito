@@ -31,8 +31,8 @@ class VllmCheckpointWeightUpdate:
 
 
 @dataclass(frozen=True, slots=True)
-class VllmNcclWeightUpdate:
-    """Named trainer weights to send through vLLM's NCCL transfer backend."""
+class VllmWeightUpdate:
+    """Named trainer weights ready for an in-memory vLLM transfer."""
 
     named_weights: Iterable[tuple[str, Any]]
 
@@ -55,7 +55,7 @@ class VllmBackendPoisonedError(RuntimeError):
 
 
 class VllmBackend:
-    """Load one model with vLLM's asynchronous Python engine.
+    """Load one model with a vLLM Python engine.
 
     vLLM is imported only while constructing this backend, so the rest of
     :mod:`chito` remains usable without the optional dependency installed.
@@ -68,7 +68,7 @@ class VllmBackend:
         max_tokens: int = 128,
         temperature: float = 1.0,
         top_p: float = 1.0,
-        weight_transfer: Literal["nccl", "checkpoint"] = "nccl",
+        weight_transfer: Literal["ipc", "nccl", "checkpoint"] = "nccl",
         engine_kwargs: Mapping[str, object] | None = None,
     ) -> None:
         if not model:
@@ -89,19 +89,22 @@ class VllmBackend:
             raise ValueError(
                 "pass weight_transfer directly instead of weight_transfer_config"
             )
-        if weight_transfer not in {"nccl", "checkpoint"}:
-            raise ValueError("weight_transfer must be 'nccl' or 'checkpoint'")
+        if weight_transfer not in {"ipc", "nccl", "checkpoint"}:
+            raise ValueError(
+                "weight_transfer must be 'ipc', 'nccl', or 'checkpoint'"
+            )
         if weight_transfer == "nccl":
             _validate_nccl_topology(options)
             options["weight_transfer_config"] = {"backend": "nccl"}
 
         try:
-            from vllm import (
-                AsyncEngineArgs,
-                AsyncLLMEngine,
-                SamplingParams,
-                TokensPrompt,
-            )
+            from vllm import SamplingParams, TokensPrompt
+
+            if weight_transfer == "ipc":
+                from ._vllm_ipc import VllmIpcRuntime
+            else:
+                from vllm import AsyncEngineArgs, AsyncLLMEngine
+
             if weight_transfer == "nccl":
                 import torch
                 from vllm.distributed.weight_transfer.base import (
@@ -120,8 +123,11 @@ class VllmBackend:
                 "install chito[vllm]"
             ) from exc
 
-        engine_args = AsyncEngineArgs(model=model, **options)
-        self._engine: Any = AsyncLLMEngine.from_engine_args(engine_args)
+        if weight_transfer == "ipc":
+            self._engine: Any = VllmIpcRuntime(model, options)
+        else:
+            engine_args = AsyncEngineArgs(model=model, **options)
+            self._engine = AsyncLLMEngine.from_engine_args(engine_args)
         self._sampling_params: Any = SamplingParams(
             n=1,
             max_tokens=max_tokens,
@@ -163,17 +169,22 @@ class VllmBackend:
 
         await self._begin_request()
         try:
-            request_id = f"{self._request_prefix}-{next(self._request_ids)}"
             prompt = self._tokens_prompt(
                 prompt_token_ids=list(request.prompt.token_ids)
             )
-            final_output = None
-            async for output in self._engine.generate(
-                prompt,
-                self._sampling_params,
-                request_id,
-            ):
-                final_output = output
+            if self._weight_transfer == "ipc":
+                final_output = await self._engine.generate(
+                    prompt, self._sampling_params
+                )
+            else:
+                request_id = f"{self._request_prefix}-{next(self._request_ids)}"
+                final_output = None
+                async for output in self._engine.generate(
+                    prompt,
+                    self._sampling_params,
+                    request_id,
+                ):
+                    final_output = output
             return self._to_result(final_output, request)
         finally:
             await self._finish_request()
@@ -194,7 +205,7 @@ class VllmBackend:
             if isinstance(update, VllmCheckpointWeightUpdate):
                 _validate_checkpoint_directory(Path(update.checkpoint_path))
             else:
-                self._validate_nccl_device(update)
+                self._validate_weight_device(update)
             await self._begin_weight_update()
             failure: BaseException | None = None
             try:
@@ -218,27 +229,36 @@ class VllmBackend:
 
     def _validate_update_type(self, update: object) -> None:
         expected = (
-            VllmNcclWeightUpdate
-            if self._weight_transfer == "nccl"
-            else VllmCheckpointWeightUpdate
+            VllmCheckpointWeightUpdate
+            if self._weight_transfer == "checkpoint"
+            else VllmWeightUpdate
         )
         if not isinstance(update, expected):
             raise TypeError(
                 f"{self._weight_transfer} transfer requires {expected.__name__}"
             )
 
-    def _validate_nccl_device(self, update: VllmNcclWeightUpdate) -> None:
+    def _validate_weight_device(self, update: VllmWeightUpdate) -> None:
         device = update.named_weights[0][1].device
         if device.type != "cuda":
-            raise ValueError("NCCL weights must be CUDA tensors")
+            raise ValueError("in-memory weights must be CUDA tensors")
         if any(weight.device != device for _, weight in update.named_weights):
-            raise ValueError("all NCCL weights must be on the same CUDA device")
-        if self._nccl_device is not None and device != self._nccl_device:
+            raise ValueError("all weights must be on the same CUDA device")
+        if (
+            self._weight_transfer == "nccl"
+            and self._nccl_device is not None
+            and device != self._nccl_device
+        ):
             raise ValueError("NCCL trainer device cannot change after initialization")
 
     async def _apply_weight_update(
-        self, update: VllmNcclWeightUpdate | VllmCheckpointWeightUpdate
+        self, update: VllmWeightUpdate | VllmCheckpointWeightUpdate
     ) -> None:
+        if self._weight_transfer == "ipc":
+            assert isinstance(update, VllmWeightUpdate)
+            await self._engine.update_weights(update.named_weights)
+            return
+
         await self._engine.pause_generation(mode="wait", clear_cache=True)
         if isinstance(update, VllmCheckpointWeightUpdate):
             await self._reload_checkpoint(update)
@@ -255,7 +275,7 @@ class VllmBackend:
             },
         )
 
-    async def _broadcast_nccl_weights(self, update: VllmNcclWeightUpdate) -> None:
+    async def _broadcast_nccl_weights(self, update: VllmWeightUpdate) -> None:
         device = update.named_weights[0][1].device
         await self._ensure_nccl_group(device)
         await self._engine.start_weight_update(is_checkpoint_format=True)
@@ -315,7 +335,7 @@ class VllmBackend:
         with self._torch.cuda.device(device):
             return self._nccl_engine.trainer_init(init_info)
 
-    def _send_nccl_weights(self, update: VllmNcclWeightUpdate) -> None:
+    def _send_nccl_weights(self, update: VllmWeightUpdate) -> None:
         with self._torch.cuda.device(self._nccl_device):
             self._nccl_engine.trainer_send_weights(
                 iter(update.named_weights),
@@ -356,7 +376,10 @@ class VllmBackend:
 
         group = self._nccl_group
         try:
-            self._engine.shutdown()
+            if self._weight_transfer == "ipc":
+                await asyncio.to_thread(self._engine.close)
+            else:
+                self._engine.shutdown()
         finally:
             self._nccl_group = None
             self._nccl_device = None
