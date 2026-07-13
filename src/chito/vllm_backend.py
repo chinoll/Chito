@@ -30,19 +30,6 @@ class VllmCheckpointWeightUpdate:
         object.__setattr__(self, "checkpoint_path", path)
 
 
-@dataclass(frozen=True, slots=True)
-class VllmWeightUpdate:
-    """Named trainer weights ready for an in-memory vLLM transfer."""
-
-    named_weights: Iterable[tuple[str, Any]]
-
-    def __post_init__(self) -> None:
-        named_weights = tuple(self.named_weights)
-        if not named_weights:
-            raise ValueError("named_weights must not be empty")
-        object.__setattr__(self, "named_weights", named_weights)
-
-
 class VllmBackendPoisonedError(RuntimeError):
     """The loaded engine may contain a partial update and must be reloaded."""
 
@@ -193,23 +180,27 @@ class VllmBackend:
         self, update: object, *, new_policy_version: int
     ) -> None:
         """Synchronously replace vLLM weights before admitting new rollout."""
-        self._validate_update_type(update)
         if not isinstance(new_policy_version, int) or isinstance(
             new_policy_version, bool
         ):
             raise TypeError("new_policy_version must be an integer")
         if new_policy_version < 0:
             raise ValueError("new_policy_version must be non-negative")
+        prepared_update = self._prepare_weight_update(update)
 
         async with self._weight_update_lock:
-            if isinstance(update, VllmCheckpointWeightUpdate):
-                _validate_checkpoint_directory(Path(update.checkpoint_path))
+            if isinstance(prepared_update, VllmCheckpointWeightUpdate):
+                _validate_checkpoint_directory(
+                    Path(prepared_update.checkpoint_path)
+                )
             else:
-                self._validate_weight_device(update)
+                self._validate_weight_device(prepared_update)
             await self._begin_weight_update()
             failure: BaseException | None = None
             try:
-                update_task = asyncio.create_task(self._apply_weight_update(update))
+                update_task = asyncio.create_task(
+                    self._apply_weight_update(prepared_update)
+                )
                 try:
                     await asyncio.shield(update_task)
                 except asyncio.CancelledError as cancellation:
@@ -227,22 +218,35 @@ class VllmBackend:
             finally:
                 await self._end_weight_update(failure)
 
-    def _validate_update_type(self, update: object) -> None:
-        expected = (
-            VllmCheckpointWeightUpdate
-            if self._weight_transfer == "checkpoint"
-            else VllmWeightUpdate
-        )
-        if not isinstance(update, expected):
+    def _prepare_weight_update(
+        self,
+        update: object,
+    ) -> VllmCheckpointWeightUpdate | tuple[tuple[str, Any], ...]:
+        if self._weight_transfer == "checkpoint":
+            if isinstance(update, VllmCheckpointWeightUpdate):
+                return update
             raise TypeError(
-                f"{self._weight_transfer} transfer requires {expected.__name__}"
+                "checkpoint transfer requires VllmCheckpointWeightUpdate"
             )
 
-    def _validate_weight_device(self, update: VllmWeightUpdate) -> None:
-        device = update.named_weights[0][1].device
+        if not isinstance(update, Iterable):
+            raise TypeError(
+                f"{self._weight_transfer} transfer requires an iterable "
+                "of named weights"
+            )
+        named_weights = tuple(update)
+        if not named_weights:
+            raise ValueError("named_weights must not be empty")
+        return named_weights
+
+    def _validate_weight_device(
+        self,
+        named_weights: tuple[tuple[str, Any], ...],
+    ) -> None:
+        device = named_weights[0][1].device
         if device.type != "cuda":
             raise ValueError("in-memory weights must be CUDA tensors")
-        if any(weight.device != device for _, weight in update.named_weights):
+        if any(weight.device != device for _, weight in named_weights):
             raise ValueError("all weights must be on the same CUDA device")
         if (
             self._weight_transfer == "nccl"
@@ -252,11 +256,12 @@ class VllmBackend:
             raise ValueError("NCCL trainer device cannot change after initialization")
 
     async def _apply_weight_update(
-        self, update: VllmWeightUpdate | VllmCheckpointWeightUpdate
+        self,
+        update: VllmCheckpointWeightUpdate | tuple[tuple[str, Any], ...],
     ) -> None:
         if self._weight_transfer == "ipc":
-            assert isinstance(update, VllmWeightUpdate)
-            await self._engine.update_weights(update.named_weights)
+            assert isinstance(update, tuple)
+            await self._engine.update_weights(update)
             return
 
         await self._engine.pause_generation(mode="wait", clear_cache=True)
@@ -275,27 +280,30 @@ class VllmBackend:
             },
         )
 
-    async def _broadcast_nccl_weights(self, update: VllmWeightUpdate) -> None:
-        device = update.named_weights[0][1].device
+    async def _broadcast_nccl_weights(
+        self,
+        named_weights: tuple[tuple[str, Any], ...],
+    ) -> None:
+        device = named_weights[0][1].device
         await self._ensure_nccl_group(device)
         await self._engine.start_weight_update(is_checkpoint_format=True)
 
         update_request = self._weight_transfer_update_request(
             update_info={
-                "names": [name for name, _ in update.named_weights],
+                "names": [name for name, _ in named_weights],
                 "dtype_names": [
                     str(weight.dtype).removeprefix("torch.")
-                    for _, weight in update.named_weights
+                    for _, weight in named_weights
                 ],
                 "shapes": [
-                    list(weight.shape) for _, weight in update.named_weights
+                    list(weight.shape) for _, weight in named_weights
                 ],
                 "packed": False,
             }
         )
         await self._wait_for_operations(
             self._engine.update_weights(update_request),
-            asyncio.to_thread(self._send_nccl_weights, update),
+            asyncio.to_thread(self._send_nccl_weights, named_weights),
         )
         await self._engine.finish_weight_update()
 
@@ -335,10 +343,13 @@ class VllmBackend:
         with self._torch.cuda.device(device):
             return self._nccl_engine.trainer_init(init_info)
 
-    def _send_nccl_weights(self, update: VllmWeightUpdate) -> None:
+    def _send_nccl_weights(
+        self,
+        named_weights: tuple[tuple[str, Any], ...],
+    ) -> None:
         with self._torch.cuda.device(self._nccl_device):
             self._nccl_engine.trainer_send_weights(
-                iter(update.named_weights),
+                iter(named_weights),
                 self._nccl_send_args(group=self._nccl_group, packed=False),
             )
 

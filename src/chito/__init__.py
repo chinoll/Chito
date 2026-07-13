@@ -31,7 +31,6 @@ from .vllm_backend import (
     VllmBackend,
     VllmBackendPoisonedError,
     VllmCheckpointWeightUpdate,
-    VllmWeightUpdate,
 )
 
 __version__ = "0.1.0"
@@ -61,5 +60,4 @@ __all__ = [
     "VllmBackend",
     "VllmBackendPoisonedError",
     "VllmCheckpointWeightUpdate",
-    "VllmWeightUpdate",
 ]
