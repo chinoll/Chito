@@ -225,15 +225,25 @@ producers and consumers, and closes the backend exactly once.
 ## Samples
 
 [`samples/train_grpo.py`](samples/train_grpo.py) is a minimal educational
-single-GPU clipped-GRPO loop. It explicitly selects checkpoint transfer because
-NCCL requires separate trainer and inference GPUs:
+single-GPU clipped-GRPO loop. Ray colocates the trainer and a synchronous vLLM
+actor on one GPU, and each optimizer step updates vLLM directly through packed
+CUDA IPC handles instead of writing a checkpoint:
 
 ```bash
 python -m pip install -e '.[vllm]'
 python samples/train_grpo.py
 ```
 
-On smaller GPUs, lower the sample's `gpu_memory_utilization` setting.
+Set `CUDA_VISIBLE_DEVICES` to select the physical GPU. Set `CHITO_MODEL` when
+the model is already available in a local directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 CHITO_MODEL=/models/Qwen2.5-0.5B-Instruct \
+  python samples/train_grpo.py
+```
+
+The packed IPC buffer must be at least as large as the model's largest tensor.
+The sample uses 320 MiB for Qwen2.5-0.5B.
 
 ## Tests
 
