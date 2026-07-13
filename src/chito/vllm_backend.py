@@ -114,7 +114,14 @@ class VllmBackend:
             self._engine: Any = VllmIpcRuntime(model, options)
         else:
             engine_args = AsyncEngineArgs(model=model, **options)
-            self._engine = AsyncLLMEngine.from_engine_args(engine_args)
+            agent_store = os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
+            try:
+                self._engine = AsyncLLMEngine.from_engine_args(engine_args)
+            finally:
+                if agent_store is None:
+                    os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
+                else:
+                    os.environ["TORCHELASTIC_USE_AGENT_STORE"] = agent_store
         self._sampling_params: Any = SamplingParams(
             n=1,
             max_tokens=max_tokens,
