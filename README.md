@@ -92,13 +92,13 @@ machine-specific path in the project:
 VENV_PATH="${VENV_PATH:-.venv-vllm}"
 uv venv --python 3.12 "$VENV_PATH"
 uv pip install --python "$VENV_PATH/bin/python" \
-  vllm==0.24.0 --torch-backend=cu129
+  vllm==0.25.0 --torch-backend=auto
 uv pip install --python "$VENV_PATH/bin/python" -e '.[test,vllm]'
 ```
 
-The adapter targets vLLM 0.24's asynchronous engine and public weight-transfer
-API. The optional dependency is bounded below by 0.24 and below the next
-unverified 0.25 release.
+The adapter targets vLLM 0.25's asynchronous engine and public weight-transfer
+API. The optional dependency is bounded below by 0.25 and below the next
+unverified 0.26 release.
 
 Constructing `VllmBackend` loads the model. Generation passes the exact prompt
 token IDs to vLLM and requests the sampled-token logprob at every generated
@@ -113,7 +113,7 @@ backend = VllmBackend(
     temperature=0.8,
     engine_kwargs={
         "dtype": "float16",
-        "device_ids": [1],  # trainer uses cuda:0
+        "device_ids": [1],  # inference uses physical GPU 1
         "gpu_memory_utilization": 0.8,
         "max_model_len": 2048,
     },
@@ -122,7 +122,8 @@ backend = VllmBackend(
 
 `engine_kwargs` are forwarded to vLLM's public `AsyncEngineArgs`. The adapter
 owns the loaded engine; call `aclose()` directly, or let `RolloutEngine.aclose()`
-close it.
+close it. In this two-GPU NCCL example, the trainer uses `cuda:0`, while vLLM
+0.25's `device_ids` selects GPU 1 for its default non-Ray executor.
 
 NCCL is the default weight-transfer mode. The trainer occupies rank 0 and must
 use a different GPU from the inference workers. Submit the trainer's checkpoint-
