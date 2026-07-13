@@ -6,16 +6,16 @@ import asyncio
 import itertools
 import os
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .models import InferenceRequest, InferenceResult
 
 
 @dataclass(frozen=True, slots=True)
-class VllmWeightUpdate:
+class VllmCheckpointWeightUpdate:
     """A complete local checkpoint to load before the next rollout version."""
 
     checkpoint_path: str | os.PathLike[str]
@@ -27,6 +27,19 @@ class VllmWeightUpdate:
         path = Path(self.checkpoint_path).expanduser().resolve()
         _validate_checkpoint_directory(path)
         object.__setattr__(self, "checkpoint_path", path)
+
+
+@dataclass(frozen=True, slots=True)
+class VllmNcclWeightUpdate:
+    """Named trainer weights to send through vLLM's NCCL transfer backend."""
+
+    named_weights: Iterable[tuple[str, Any]]
+
+    def __post_init__(self) -> None:
+        named_weights = tuple(self.named_weights)
+        if not named_weights:
+            raise ValueError("named_weights must not be empty")
+        object.__setattr__(self, "named_weights", named_weights)
 
 
 class VllmBackendPoisonedError(RuntimeError):
@@ -54,6 +67,7 @@ class VllmBackend:
         max_tokens: int = 128,
         temperature: float = 1.0,
         top_p: float = 1.0,
+        weight_transfer: Literal["nccl", "checkpoint"] = "nccl",
         engine_kwargs: Mapping[str, object] | None = None,
     ) -> None:
         if not model:
@@ -70,6 +84,14 @@ class VllmBackend:
         options = dict(engine_kwargs or {})
         if "model" in options:
             raise ValueError("pass model directly instead of through engine_kwargs")
+        if "weight_transfer_config" in options:
+            raise ValueError(
+                "pass weight_transfer directly instead of weight_transfer_config"
+            )
+        if weight_transfer not in {"nccl", "checkpoint"}:
+            raise ValueError("weight_transfer must be 'nccl' or 'checkpoint'")
+        if weight_transfer == "nccl":
+            options["weight_transfer_config"] = {"backend": "nccl"}
 
         try:
             from vllm import (
@@ -134,8 +156,8 @@ class VllmBackend:
         self, update: object, *, new_policy_version: int
     ) -> None:
         """Synchronously reload one complete local checkpoint into vLLM."""
-        if not isinstance(update, VllmWeightUpdate):
-            raise TypeError("update must be a VllmWeightUpdate")
+        if not isinstance(update, VllmCheckpointWeightUpdate):
+            raise TypeError("update must be a VllmCheckpointWeightUpdate")
         if not isinstance(new_policy_version, int) or isinstance(
             new_policy_version, bool
         ):

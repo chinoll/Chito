@@ -15,7 +15,7 @@ from chito import (
     RolloutSample,
     SingleTurnWorkflow,
     VllmBackend,
-    VllmWeightUpdate,
+    VllmCheckpointWeightUpdate,
 )
 
 
@@ -114,7 +114,7 @@ def test_qwen_half_billion_model_rollout_and_weight_update() -> None:
                 del trainer
                 torch.cuda.empty_cache()
 
-                update = VllmWeightUpdate(path)
+                update = VllmCheckpointWeightUpdate(path)
                 assert await engine.update_weights(update) == 1
             del update
             torch.cuda.empty_cache()

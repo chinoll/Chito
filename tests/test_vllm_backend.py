@@ -13,7 +13,8 @@ from chito import (
     RolloutPrompt,
     VllmBackend,
     VllmBackendPoisonedError,
-    VllmWeightUpdate,
+    VllmCheckpointWeightUpdate,
+    VllmNcclWeightUpdate,
 )
 
 
@@ -125,8 +126,8 @@ def request(sample_index: int = 0) -> InferenceRequest:
     )
 
 
-def weight_update() -> VllmWeightUpdate:
-    return VllmWeightUpdate(FakeAsyncLLMEngine.checkpoint_path)
+def weight_update() -> VllmCheckpointWeightUpdate:
+    return VllmCheckpointWeightUpdate(FakeAsyncLLMEngine.checkpoint_path)
 
 
 def test_backend_uses_token_prompt_and_sampled_logprobs(fake_vllm) -> None:
@@ -149,6 +150,7 @@ def test_backend_uses_token_prompt_and_sampled_logprobs(fake_vllm) -> None:
         assert fake_engine.engine_args.kwargs == {
             "model": "model-id",
             "dtype": "float16",
+            "weight_transfer_config": {"backend": "nccl"},
         }
         assert fake_engine.max_active == 2
         assert [call[0] for call in fake_engine.calls] == [
@@ -196,6 +198,21 @@ def test_backend_reloads_complete_local_checkpoint(fake_vllm) -> None:
         await backend.aclose()
 
     asyncio.run(scenario())
+
+
+def test_checkpoint_transfer_does_not_configure_nccl(fake_vllm) -> None:
+    VllmBackend("model-id", weight_transfer="checkpoint")
+
+    assert FakeAsyncLLMEngine.instance.engine_args.kwargs == {"model": "model-id"}
+
+
+def test_nccl_weight_update_freezes_named_weights() -> None:
+    update = VllmNcclWeightUpdate(iter([("layer.weight", object())]))
+
+    assert isinstance(update.named_weights, tuple)
+    assert update.named_weights[0][0] == "layer.weight"
+    with pytest.raises(ValueError, match="must not be empty"):
+        VllmNcclWeightUpdate(iter(()))
 
 
 def test_invalid_checkpoint_before_admission_can_be_retried(fake_vllm) -> None:
@@ -333,7 +350,7 @@ def test_cancelled_active_reload_finishes_before_backend_is_poisoned(
 def test_backend_rejects_unknown_weight_update_type(fake_vllm) -> None:
     async def scenario() -> None:
         backend = VllmBackend("model-id")
-        with pytest.raises(TypeError, match="VllmWeightUpdate"):
+        with pytest.raises(TypeError, match="VllmCheckpointWeightUpdate"):
             await backend.update_weights(object(), new_policy_version=1)
         await backend.aclose()
 
@@ -366,6 +383,11 @@ def test_chito_import_does_not_import_optional_vllm(monkeypatch) -> None:
         ({"temperature": -0.1}, "temperature must be non-negative"),
         ({"top_p": 0.0}, "top_p must be in the interval"),
         ({"engine_kwargs": {"model": "other"}}, "pass model directly"),
+        ({"weight_transfer": "other"}, "weight_transfer must be"),
+        (
+            {"engine_kwargs": {"weight_transfer_config": {}}},
+            "pass weight_transfer directly",
+        ),
     ],
 )
 def test_backend_configuration_fails_fast(fake_vllm, kwargs, error) -> None:
@@ -376,15 +398,15 @@ def test_backend_configuration_fails_fast(fake_vllm, kwargs, error) -> None:
 def test_weight_update_requires_existing_directory(tmp_path) -> None:
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
-    update = VllmWeightUpdate(checkpoint)
+    update = VllmCheckpointWeightUpdate(checkpoint)
 
     assert update.checkpoint_path == checkpoint.resolve()
     with pytest.raises(ValueError, match="must not be empty"):
-        VllmWeightUpdate("")
+        VllmCheckpointWeightUpdate("")
     with pytest.raises(FileNotFoundError):
-        VllmWeightUpdate(tmp_path / "missing")
+        VllmCheckpointWeightUpdate(tmp_path / "missing")
 
     checkpoint_file = tmp_path / "checkpoint.bin"
     checkpoint_file.touch()
     with pytest.raises(NotADirectoryError):
-        VllmWeightUpdate(checkpoint_file)
+        VllmCheckpointWeightUpdate(checkpoint_file)

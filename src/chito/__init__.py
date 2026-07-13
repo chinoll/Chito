@@ -30,7 +30,8 @@ from .workflows import SingleTurnWorkflow
 from .vllm_backend import (
     VllmBackend,
     VllmBackendPoisonedError,
-    VllmWeightUpdate,
+    VllmCheckpointWeightUpdate,
+    VllmNcclWeightUpdate,
 )
 
 __version__ = "0.1.0"
@@ -59,5 +60,6 @@ __all__ = [
     "TrainingBatch",
     "VllmBackend",
     "VllmBackendPoisonedError",
-    "VllmWeightUpdate",
+    "VllmCheckpointWeightUpdate",
+    "VllmNcclWeightUpdate",
 ]
