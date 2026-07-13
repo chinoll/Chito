@@ -16,7 +16,6 @@ from chito import (
     SingleTurnWorkflow,
     TrainingBatch,
     VllmBackend,
-    VllmWeightUpdate,
 )
 
 
@@ -156,9 +155,7 @@ async def main() -> None:
             loss.backward()
             optimizer.step()
 
-            policy_version = await engine.update_weights(
-                VllmWeightUpdate(model.named_parameters())
-            )
+            policy_version = await engine.update_weights(model.named_parameters())
             print(
                 f"step={step} loss={loss.item():.4f} "
                 f"policy_version={policy_version}"

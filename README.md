@@ -129,12 +129,9 @@ use a different GPU from the inference workers. Submit the trainer's checkpoint-
 format named parameters after each optimizer step:
 
 ```python
-from chito import VllmWeightUpdate
-
-update = VllmWeightUpdate(
-    trainer.named_parameters(),
+new_policy_version = await engine.update_weights(
+    trainer.named_parameters()
 )
-new_policy_version = await engine.update_weights(update)
 ```
 
 On the first update, the backend creates one local NCCL group containing the
@@ -152,14 +149,14 @@ CUDA_VISIBLE_DEVICES=0 python train.py
 ```
 
 ```python
-from chito import VllmBackend, VllmWeightUpdate
+from chito import VllmBackend
 
 backend = VllmBackend(model, weight_transfer="ipc")
 
 # The trainer stays in the driver process.
 optimizer.step()
 new_policy_version = await engine.update_weights(
-    VllmWeightUpdate(trainer.named_parameters())
+    trainer.named_parameters()
 )
 ```
 
