@@ -286,7 +286,7 @@ class VllmBackend:
     ) -> None:
         device = named_weights[0][1].device
         await self._ensure_nccl_group(device)
-        await self._engine.start_weight_update(is_checkpoint_format=True)
+        await self._engine.start_weight_update()
 
         update_request = self._weight_transfer_update_request(
             update_info={

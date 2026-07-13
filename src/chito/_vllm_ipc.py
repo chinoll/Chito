@@ -144,11 +144,7 @@ class VllmIpcRuntime:
             ),
         )
         await self._get(self._llm.sleep.remote(level=0, mode="wait"))
-        await self._get(
-            self._llm.start_weight_update.remote(
-                is_checkpoint_format=True
-            )
-        )
+        await self._get(self._llm.start_weight_update.remote())
         await asyncio.to_thread(
             self._send_weights,
             named_weights,
