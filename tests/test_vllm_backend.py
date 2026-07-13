@@ -46,18 +46,29 @@ class FakeNCCLSendArgs:
         self.packed = packed
 
 
+class FakeNCCLGroup:
+    def __init__(self) -> None:
+        self.destroy_count = 0
+
+    def destroy(self) -> None:
+        self.destroy_count += 1
+
+
 class FakeNCCLEngine:
-    group = object()
+    group = FakeNCCLGroup()
     init_started = threading.Event()
     send_started = threading.Event()
+    send_release = threading.Event()
     init_calls: list[dict[str, object]] = []
     send_calls: list[tuple[tuple[tuple[str, object], ...], FakeNCCLSendArgs]] = []
 
     @classmethod
     def reset(cls) -> None:
-        cls.group = object()
+        cls.group = FakeNCCLGroup()
         cls.init_started = threading.Event()
         cls.send_started = threading.Event()
+        cls.send_release = threading.Event()
+        cls.send_release.set()
         cls.init_calls = []
         cls.send_calls = []
 
@@ -71,14 +82,27 @@ class FakeNCCLEngine:
     def trainer_send_weights(cls, iterator, args) -> None:
         cls.send_calls.append((tuple(iterator), args))
         cls.send_started.set()
+        assert cls.send_release.wait(1)
+
+
+class FakeCudaDeviceContext:
+    def __init__(self, device) -> None:
+        self.device = device
+
+    def __enter__(self) -> None:
+        FakeCuda.devices.append(self.device)
+
+    def __exit__(self, *_exc) -> None:
+        FakeCuda.restored += 1
 
 
 class FakeCuda:
     devices: list[object] = []
+    restored = 0
 
     @classmethod
-    def set_device(cls, device) -> None:
-        cls.devices.append(device)
+    def device(cls, device) -> FakeCudaDeviceContext:
+        return FakeCudaDeviceContext(device)
 
 
 @dataclass(frozen=True)
@@ -197,6 +221,7 @@ def fake_vllm(monkeypatch, tmp_path):
     FakeAsyncLLMEngine.checkpoint_path = checkpoint
     FakeNCCLEngine.reset()
     FakeCuda.devices = []
+    FakeCuda.restored = 0
 
     module = ModuleType("vllm")
     module.AsyncEngineArgs = FakeAsyncEngineArgs
@@ -392,6 +417,41 @@ def test_backend_broadcasts_nccl_weights_and_reuses_group(fake_vllm) -> None:
             "resume",
         ]
         await backend.aclose()
+        assert FakeNCCLEngine.group.destroy_count == 1
+        assert FakeCuda.devices == [FakeDevice(), FakeDevice(), FakeDevice()]
+        assert FakeCuda.restored == 3
+
+    asyncio.run(scenario())
+
+
+def test_nccl_failure_waits_for_sender_before_poisoning(fake_vllm) -> None:
+    async def scenario() -> None:
+        backend = VllmBackend("model-id")
+        fake_engine = FakeAsyncLLMEngine.instance
+        fake_engine.failures["receive"] = 1
+        FakeNCCLEngine.send_release.clear()
+        update = VllmNcclWeightUpdate([("model.a", FakeTensor((1,)))])
+
+        update_task = asyncio.create_task(
+            backend.update_weights(update, new_policy_version=1)
+        )
+        sent = await asyncio.to_thread(FakeNCCLEngine.send_started.wait, 1)
+        assert sent
+        await asyncio.sleep(0)
+        assert not update_task.done()
+
+        generation_task = asyncio.create_task(backend.generate(request()))
+        await asyncio.sleep(0)
+        assert not generation_task.done()
+
+        FakeNCCLEngine.send_release.set()
+        with pytest.raises(RuntimeError, match="receive failed"):
+            await update_task
+        with pytest.raises(VllmBackendPoisonedError):
+            await generation_task
+        assert fake_engine.events == ["pause", "init", "start", "receive"]
+        await backend.aclose()
+        assert FakeNCCLEngine.group.destroy_count == 1
 
     asyncio.run(scenario())
 
@@ -586,6 +646,18 @@ def test_chito_import_does_not_import_optional_vllm(monkeypatch) -> None:
         ({"engine_kwargs": {"model": "other"}}, "pass model directly"),
         ({"weight_transfer": "other"}, "weight_transfer must be"),
         (
+            {"engine_kwargs": {"nnodes": 2}},
+            "currently requires one node",
+        ),
+        (
+            {"engine_kwargs": {"prefill_context_parallel_size": 2}},
+            "does not support prefill context parallelism",
+        ),
+        (
+            {"engine_kwargs": {"distributed_executor_backend": "external_launcher"}},
+            "does not support external_launcher",
+        ),
+        (
             {"engine_kwargs": {"weight_transfer_config": {}}},
             "pass weight_transfer directly",
         ),
@@ -594,6 +666,13 @@ def test_chito_import_does_not_import_optional_vllm(monkeypatch) -> None:
 def test_backend_configuration_fails_fast(fake_vllm, kwargs, error) -> None:
     with pytest.raises(ValueError, match=error):
         VllmBackend("model-id", **kwargs)
+
+
+def test_nccl_rejects_vllm_data_parallel_environment(fake_vllm, monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_DP_SIZE", "2")
+
+    with pytest.raises(ValueError, match="pass data_parallel_size"):
+        VllmBackend("model-id")
 
 
 def test_weight_update_requires_existing_directory(tmp_path) -> None:

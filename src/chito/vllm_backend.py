@@ -7,7 +7,7 @@ import itertools
 import os
 import socket
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -92,6 +92,7 @@ class VllmBackend:
         if weight_transfer not in {"nccl", "checkpoint"}:
             raise ValueError("weight_transfer must be 'nccl' or 'checkpoint'")
         if weight_transfer == "nccl":
+            _validate_nccl_topology(options)
             options["weight_transfer_config"] = {"backend": "nccl"}
 
         try:
@@ -272,7 +273,7 @@ class VllmBackend:
                 "packed": False,
             }
         )
-        await asyncio.gather(
+        await self._wait_for_operations(
             self._engine.update_weights(update_request),
             asyncio.to_thread(self._send_nccl_weights, update),
         )
@@ -284,7 +285,7 @@ class VllmBackend:
 
         init_info = {
             "master_address": "127.0.0.1",
-            "master_port": _unused_local_port(),
+            "master_port": _find_free_local_port(),
             "rank_offset": 1,
             "world_size": self._inference_world_size + 1,
         }
@@ -295,7 +296,7 @@ class VllmBackend:
             "master_port": init_info["master_port"],
             "world_size": init_info["world_size"],
         }
-        _, group = await asyncio.gather(
+        _, group = await self._wait_for_operations(
             receiver_init,
             asyncio.to_thread(self._init_nccl_trainer, device, trainer_info),
         )
@@ -303,15 +304,27 @@ class VllmBackend:
         self._nccl_device = device
 
     def _init_nccl_trainer(self, device: Any, init_info: dict[str, Any]) -> Any:
-        self._torch.cuda.set_device(device)
-        return self._nccl_engine.trainer_init(init_info)
+        with self._torch.cuda.device(device):
+            return self._nccl_engine.trainer_init(init_info)
 
     def _send_nccl_weights(self, update: VllmNcclWeightUpdate) -> None:
-        self._torch.cuda.set_device(self._nccl_device)
-        self._nccl_engine.trainer_send_weights(
-            iter(update.named_weights),
-            self._nccl_send_args(group=self._nccl_group, packed=False),
-        )
+        with self._torch.cuda.device(self._nccl_device):
+            self._nccl_engine.trainer_send_weights(
+                iter(update.named_weights),
+                self._nccl_send_args(group=self._nccl_group, packed=False),
+            )
+
+    @staticmethod
+    async def _wait_for_operations(
+        first: Awaitable[Any], second: Awaitable[Any]
+    ) -> tuple[Any, Any]:
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("concurrent weight transfer failed", errors)
+        return results[0], results[1]
 
     async def aclose(self) -> None:
         """Wait for admitted operations and release vLLM resources once."""
@@ -329,13 +342,19 @@ class VllmBackend:
                 and not self._weight_update_in_progress
             )
 
+        group = self._nccl_group
         try:
             self._engine.shutdown()
         finally:
             self._nccl_group = None
-            async with self._lifecycle:
-                self._closed = True
-                self._lifecycle.notify_all()
+            self._nccl_device = None
+            try:
+                if group is not None:
+                    group.destroy()
+            finally:
+                async with self._lifecycle:
+                    self._closed = True
+                    self._lifecycle.notify_all()
 
     async def _begin_request(self) -> None:
         async with self._lifecycle:
@@ -422,7 +441,22 @@ def _validate_checkpoint_directory(path: Path) -> None:
         raise NotADirectoryError(f"checkpoint path is not a directory: {path}")
 
 
-def _unused_local_port() -> int:
+def _validate_nccl_topology(options: Mapping[str, object]) -> None:
+    if int(options.get("nnodes", 1)) != 1:
+        raise ValueError("NCCL weight transfer currently requires one node")
+    if int(options.get("prefill_context_parallel_size", 1)) != 1:
+        raise ValueError(
+            "NCCL weight transfer does not support prefill context parallelism"
+        )
+    if options.get("distributed_executor_backend") == "external_launcher":
+        raise ValueError("NCCL weight transfer does not support external_launcher")
+    if int(os.environ.get("VLLM_DP_SIZE", "1")) != 1:
+        raise ValueError(
+            "pass data_parallel_size through engine_kwargs instead of VLLM_DP_SIZE"
+        )
+
+
+def _find_free_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
