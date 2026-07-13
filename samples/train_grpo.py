@@ -17,7 +17,7 @@ from chito import (
     SingleTurnWorkflow,
     TrainingBatch,
     VllmBackend,
-    VllmWeightUpdate,
+    VllmCheckpointWeightUpdate,
 )
 
 
@@ -129,6 +129,7 @@ async def main() -> None:
         max_tokens=MAX_NEW_TOKENS,
         temperature=1.0,
         top_p=1.0,
+        weight_transfer="checkpoint",
         engine_kwargs={
             "dtype": "float16",
             "enforce_eager": True,
@@ -162,7 +163,7 @@ async def main() -> None:
             trainer.save_pretrained(checkpoint, safe_serialization=True)
             tokenizer.save_pretrained(checkpoint)
             policy_version = await engine.update_weights(
-                VllmWeightUpdate(checkpoint)
+                VllmCheckpointWeightUpdate(checkpoint)
             )
             print(
                 f"step={step} loss={loss.item():.4f} "

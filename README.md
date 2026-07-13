@@ -97,7 +97,7 @@ uv pip install --python "$VENV_PATH/bin/python" \
 uv pip install --python "$VENV_PATH/bin/python" -e '.[test]'
 ```
 
-The adapter targets vLLM 0.24's asynchronous engine and public checkpoint reload
+The adapter targets vLLM 0.24's asynchronous engine and public weight-transfer
 API. The optional dependency is bounded below by 0.24 and below the next
 unverified 0.25 release.
 
@@ -114,6 +114,7 @@ backend = VllmBackend(
     temperature=0.8,
     engine_kwargs={
         "dtype": "float16",
+        "device_ids": [1],  # trainer uses cuda:0
         "gpu_memory_utilization": 0.8,
         "max_model_len": 2048,
     },
@@ -124,29 +125,45 @@ backend = VllmBackend(
 owns the loaded engine; call `aclose()` directly, or let `RolloutEngine.aclose()`
 close it.
 
-V1 supports synchronous updates from a complete local Hugging Face checkpoint.
-Save each trained policy to a new immutable directory before submitting it:
+NCCL is the default weight-transfer mode. The trainer occupies rank 0 and must
+use a different GPU from the inference workers. Submit the trainer's checkpoint-
+format named parameters after each optimizer step:
 
 ```python
-from chito import VllmWeightUpdate
+from chito import VllmNcclWeightUpdate
 
-update = VllmWeightUpdate(
-    "/checkpoints/policy-0001",
+update = VllmNcclWeightUpdate(
+    trainer.named_parameters(),
 )
 new_policy_version = await engine.update_weights(update)
 ```
 
-The backend blocks new generation and drains its own active requests, pauses
-vLLM with cache clearing, invokes vLLM's public `reload_weights` collective RPC,
-and resumes generation only after every worker has loaded the complete
-checkpoint. The checkpoint path is resolved to an absolute path and must be
-visible to every vLLM worker.
+On the first update, the backend creates one local NCCL group containing the
+trainer and all data-, pipeline-, and tensor-parallel inference workers. Later
+updates reuse that group. Each update pauses generation, runs vLLM's public
+`start_weight_update` / `update_weights` / `finish_weight_update` protocol, and
+resumes only after every worker has loaded the new weights. V1 assumes the
+trainer and inference workers are on the same machine.
+
+For a single-GPU setup, explicitly select the checkpoint fallback and save each
+policy to a new immutable directory:
+
+```python
+from chito import VllmBackend, VllmCheckpointWeightUpdate
+
+backend = VllmBackend(model, weight_transfer="checkpoint")
+update = VllmCheckpointWeightUpdate("/checkpoints/policy-0001")
+new_policy_version = await engine.update_weights(update)
+```
+
+Checkpoint mode invokes vLLM's public `reload_weights` collective RPC. The path
+is resolved to an absolute directory and must be visible to every vLLM worker.
 
 An invalid or deleted checkpoint directory is rejected before vLLM is paused and
-can be corrected and retried. Once pause, reload, or resume fails, the loaded
-model may contain partial weights; the backend becomes poisoned and rejects
-generation and further updates. Close it and load a fresh backend rather than
-assigning a policy version to uncertain weights.
+can be corrected and retried. Once a physical pause, transfer, load, or resume
+phase fails, the model may contain partial weights; the backend becomes poisoned
+and rejects generation and further updates. Close it and load a fresh backend
+rather than assigning a policy version to uncertain weights.
 
 ## Usage
 
@@ -208,7 +225,8 @@ producers and consumers, and closes the backend exactly once.
 ## Samples
 
 [`samples/train_grpo.py`](samples/train_grpo.py) is a minimal educational
-clipped-GRPO loop using the current synchronous checkpoint reload flow:
+single-GPU clipped-GRPO loop. It explicitly selects checkpoint transfer because
+NCCL requires separate trainer and inference GPUs:
 
 ```bash
 python -m pip install -e '.[vllm]'
