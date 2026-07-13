@@ -69,6 +69,7 @@ def test_qwen_half_billion_model_rollout_and_weight_update() -> None:
             MODEL,
             max_tokens=1,
             temperature=0.0,
+            weight_transfer="checkpoint",
             engine_kwargs={
                 "dtype": os.environ.get("CHITO_VLLM_DTYPE", "float16"),
                 "enforce_eager": True,

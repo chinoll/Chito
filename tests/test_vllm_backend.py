@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import builtins
 import sys
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -28,6 +30,70 @@ class FakeSamplingParams:
         self.kwargs = kwargs
 
 
+class FakeWeightTransferInitRequest:
+    def __init__(self, *, init_info) -> None:
+        self.init_info = init_info
+
+
+class FakeWeightTransferUpdateRequest:
+    def __init__(self, *, update_info) -> None:
+        self.update_info = update_info
+
+
+class FakeNCCLSendArgs:
+    def __init__(self, *, group, packed) -> None:
+        self.group = group
+        self.packed = packed
+
+
+class FakeNCCLEngine:
+    group = object()
+    init_started = threading.Event()
+    send_started = threading.Event()
+    init_calls: list[dict[str, object]] = []
+    send_calls: list[tuple[tuple[tuple[str, object], ...], FakeNCCLSendArgs]] = []
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.group = object()
+        cls.init_started = threading.Event()
+        cls.send_started = threading.Event()
+        cls.init_calls = []
+        cls.send_calls = []
+
+    @classmethod
+    def trainer_init(cls, init_info):
+        cls.init_calls.append(init_info)
+        cls.init_started.set()
+        return cls.group
+
+    @classmethod
+    def trainer_send_weights(cls, iterator, args) -> None:
+        cls.send_calls.append((tuple(iterator), args))
+        cls.send_started.set()
+
+
+class FakeCuda:
+    devices: list[object] = []
+
+    @classmethod
+    def set_device(cls, device) -> None:
+        cls.devices.append(device)
+
+
+@dataclass(frozen=True)
+class FakeDevice:
+    type: str = "cuda"
+    index: int = 0
+
+
+@dataclass(frozen=True)
+class FakeTensor:
+    shape: tuple[int, ...]
+    dtype: str = "torch.float16"
+    device: FakeDevice = FakeDevice()
+
+
 class FakeAsyncLLMEngine:
     instance: FakeAsyncLLMEngine
     checkpoint_path: Path
@@ -46,6 +112,8 @@ class FakeAsyncLLMEngine:
         self.reload_started = asyncio.Event()
         self.reload_release = asyncio.Event()
         self.reload_release.set()
+        self.weight_init_requests: list[FakeWeightTransferInitRequest] = []
+        self.weight_update_requests: list[FakeWeightTransferUpdateRequest] = []
 
     @classmethod
     def from_engine_args(
@@ -89,6 +157,25 @@ class FakeAsyncLLMEngine:
         self.reload_started.set()
         await self.reload_release.wait()
 
+    async def init_weight_transfer_engine(self, request) -> None:
+        self.weight_init_requests.append(request)
+        self._phase("init")
+        initialized = await asyncio.to_thread(FakeNCCLEngine.init_started.wait, 1)
+        assert initialized
+
+    async def start_weight_update(self, *, is_checkpoint_format) -> None:
+        assert is_checkpoint_format is True
+        self._phase("start")
+
+    async def update_weights(self, request) -> None:
+        self.weight_update_requests.append(request)
+        self._phase("receive")
+        sent = await asyncio.to_thread(FakeNCCLEngine.send_started.wait, 1)
+        assert sent
+
+    async def finish_weight_update(self) -> None:
+        self._phase("finish")
+
     async def resume_generation(self) -> None:
         self._phase("resume")
 
@@ -108,13 +195,37 @@ def fake_vllm(monkeypatch, tmp_path):
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     FakeAsyncLLMEngine.checkpoint_path = checkpoint
+    FakeNCCLEngine.reset()
+    FakeCuda.devices = []
 
     module = ModuleType("vllm")
     module.AsyncEngineArgs = FakeAsyncEngineArgs
     module.AsyncLLMEngine = FakeAsyncLLMEngine
     module.SamplingParams = FakeSamplingParams
     module.TokensPrompt = lambda **kwargs: kwargs
+    base_module = ModuleType("vllm.distributed.weight_transfer.base")
+    base_module.WeightTransferInitRequest = FakeWeightTransferInitRequest
+    base_module.WeightTransferUpdateRequest = FakeWeightTransferUpdateRequest
+    nccl_module = ModuleType("vllm.distributed.weight_transfer.nccl_engine")
+    nccl_module.NCCLTrainerSendWeightsArgs = FakeNCCLSendArgs
+    nccl_module.NCCLWeightTransferEngine = FakeNCCLEngine
+    torch_module = ModuleType("torch")
+    torch_module.cuda = FakeCuda
+
     monkeypatch.setitem(sys.modules, "vllm", module)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", ModuleType("vllm.distributed"))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.weight_transfer",
+        ModuleType("vllm.distributed.weight_transfer"),
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm.distributed.weight_transfer.base", base_module
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm.distributed.weight_transfer.nccl_engine", nccl_module
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
     return module
 
 
@@ -179,7 +290,7 @@ def test_backend_uses_token_prompt_and_sampled_logprobs(fake_vllm) -> None:
 
 def test_backend_reloads_complete_local_checkpoint(fake_vllm) -> None:
     async def scenario() -> None:
-        backend = VllmBackend("model-id")
+        backend = VllmBackend("model-id", weight_transfer="checkpoint")
         fake_engine = FakeAsyncLLMEngine.instance
         update = weight_update()
 
@@ -215,9 +326,99 @@ def test_nccl_weight_update_freezes_named_weights() -> None:
         VllmNcclWeightUpdate(iter(()))
 
 
+def test_backend_broadcasts_nccl_weights_and_reuses_group(fake_vllm) -> None:
+    async def scenario() -> None:
+        backend = VllmBackend(
+            "model-id",
+            engine_kwargs={
+                "data_parallel_size": 2,
+                "pipeline_parallel_size": 1,
+                "tensor_parallel_size": 2,
+            },
+        )
+        fake_engine = FakeAsyncLLMEngine.instance
+        update = VllmNcclWeightUpdate(
+            [
+                ("model.a", FakeTensor((2, 3))),
+                ("model.b", FakeTensor((4,), dtype="torch.float32")),
+            ]
+        )
+
+        await backend.update_weights(update, new_policy_version=1)
+        await backend.update_weights(update, new_policy_version=2)
+
+        assert len(FakeNCCLEngine.init_calls) == 1
+        init_info = fake_engine.weight_init_requests[0].init_info
+        assert init_info["master_address"] == "127.0.0.1"
+        assert init_info["rank_offset"] == 1
+        assert init_info["world_size"] == 5
+        assert FakeNCCLEngine.init_calls == [
+            {
+                "master_address": "127.0.0.1",
+                "master_port": init_info["master_port"],
+                "world_size": 5,
+            }
+        ]
+        assert [request.update_info for request in fake_engine.weight_update_requests] == [
+            {
+                "names": ["model.a", "model.b"],
+                "dtype_names": ["float16", "float32"],
+                "shapes": [[2, 3], [4]],
+                "packed": False,
+            },
+            {
+                "names": ["model.a", "model.b"],
+                "dtype_names": ["float16", "float32"],
+                "shapes": [[2, 3], [4]],
+                "packed": False,
+            },
+        ]
+        assert len(FakeNCCLEngine.send_calls) == 2
+        assert all(
+            call[1].group is FakeNCCLEngine.group and call[1].packed is False
+            for call in FakeNCCLEngine.send_calls
+        )
+        assert fake_engine.events == [
+            "pause",
+            "init",
+            "start",
+            "receive",
+            "finish",
+            "resume",
+            "pause",
+            "start",
+            "receive",
+            "finish",
+            "resume",
+        ]
+        await backend.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_transfer_mode_requires_matching_update_type(fake_vllm) -> None:
+    async def scenario() -> None:
+        nccl_backend = VllmBackend("model-id")
+        with pytest.raises(TypeError, match="nccl transfer requires VllmNccl"):
+            await nccl_backend.update_weights(weight_update(), new_policy_version=1)
+        await nccl_backend.aclose()
+
+        checkpoint_backend = VllmBackend(
+            "model-id", weight_transfer="checkpoint"
+        )
+        with pytest.raises(TypeError, match="checkpoint transfer requires"):
+            await checkpoint_backend.update_weights(
+                VllmNcclWeightUpdate([("model.a", FakeTensor((1,)))]),
+                new_policy_version=1,
+            )
+        await checkpoint_backend.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_invalid_checkpoint_before_admission_can_be_retried(fake_vllm) -> None:
     async def scenario() -> None:
-        backend = VllmBackend("model-id")
+        backend = VllmBackend("model-id", weight_transfer="checkpoint")
         fake_engine = FakeAsyncLLMEngine.instance
         update = weight_update()
         update.checkpoint_path.rmdir()
@@ -237,7 +438,7 @@ def test_invalid_checkpoint_before_admission_can_be_retried(fake_vllm) -> None:
 @pytest.mark.parametrize("phase", ["pause", "reload", "resume"])
 def test_unsafe_update_failure_poisons_backend(fake_vllm, phase: str) -> None:
     async def scenario() -> None:
-        backend = VllmBackend("model-id")
+        backend = VllmBackend("model-id", weight_transfer="checkpoint")
         fake_engine = FakeAsyncLLMEngine.instance
         fake_engine.failures[phase] = 1
 
@@ -257,7 +458,7 @@ def test_unsafe_update_failure_poisons_backend(fake_vllm, phase: str) -> None:
 
 def test_update_drains_requests_and_blocks_new_generation(fake_vllm) -> None:
     async def scenario() -> None:
-        backend = VllmBackend("model-id")
+        backend = VllmBackend("model-id", weight_transfer="checkpoint")
         fake_engine = FakeAsyncLLMEngine.instance
 
         first_generation = asyncio.create_task(backend.generate(request(0)))
@@ -289,7 +490,7 @@ def test_update_drains_requests_and_blocks_new_generation(fake_vllm) -> None:
 
 def test_cancelled_update_waiter_reopens_generation(fake_vllm) -> None:
     async def scenario() -> None:
-        backend = VllmBackend("model-id")
+        backend = VllmBackend("model-id", weight_transfer="checkpoint")
         fake_engine = FakeAsyncLLMEngine.instance
 
         first_generation = asyncio.create_task(backend.generate(request(0)))
@@ -319,7 +520,7 @@ def test_cancelled_active_reload_finishes_before_backend_is_poisoned(
     fake_vllm,
 ) -> None:
     async def scenario() -> None:
-        backend = VllmBackend("model-id")
+        backend = VllmBackend("model-id", weight_transfer="checkpoint")
         fake_engine = FakeAsyncLLMEngine.instance
         fake_engine.reload_release.clear()
 
@@ -341,7 +542,7 @@ def test_cancelled_active_reload_finishes_before_backend_is_poisoned(
         with pytest.raises(VllmBackendPoisonedError) as poisoned:
             await generation_task
         assert isinstance(poisoned.value.cause, asyncio.CancelledError)
-        assert fake_engine.events == ["pause", "reload"]
+        assert fake_engine.events == ["pause", "reload", "resume"]
         await backend.aclose()
 
     asyncio.run(scenario())
@@ -349,7 +550,7 @@ def test_cancelled_active_reload_finishes_before_backend_is_poisoned(
 
 def test_backend_rejects_unknown_weight_update_type(fake_vllm) -> None:
     async def scenario() -> None:
-        backend = VllmBackend("model-id")
+        backend = VllmBackend("model-id", weight_transfer="checkpoint")
         with pytest.raises(TypeError, match="VllmCheckpointWeightUpdate"):
             await backend.update_weights(object(), new_policy_version=1)
         await backend.aclose()

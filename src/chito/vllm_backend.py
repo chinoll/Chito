@@ -1,10 +1,11 @@
-"""vLLM backend for token-exact generation and checkpoint reloads."""
+"""vLLM backend for token-exact generation and synchronous weight updates."""
 
 from __future__ import annotations
 
 import asyncio
 import itertools
 import os
+import socket
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -100,6 +101,16 @@ class VllmBackend:
                 SamplingParams,
                 TokensPrompt,
             )
+            if weight_transfer == "nccl":
+                import torch
+                from vllm.distributed.weight_transfer.base import (
+                    WeightTransferInitRequest,
+                    WeightTransferUpdateRequest,
+                )
+                from vllm.distributed.weight_transfer.nccl_engine import (
+                    NCCLTrainerSendWeightsArgs,
+                    NCCLWeightTransferEngine,
+                )
         except ModuleNotFoundError as exc:
             if exc.name != "vllm":
                 raise
@@ -119,6 +130,20 @@ class VllmBackend:
             detokenize=False,
         )
         self._tokens_prompt = TokensPrompt
+        self._weight_transfer = weight_transfer
+        self._inference_world_size = (
+            int(options.get("data_parallel_size", 1))
+            * int(options.get("pipeline_parallel_size", 1))
+            * int(options.get("tensor_parallel_size", 1))
+        )
+        self._nccl_group: Any = None
+        self._nccl_device: Any = None
+        if weight_transfer == "nccl":
+            self._torch = torch
+            self._weight_transfer_init_request = WeightTransferInitRequest
+            self._weight_transfer_update_request = WeightTransferUpdateRequest
+            self._nccl_send_args = NCCLTrainerSendWeightsArgs
+            self._nccl_engine = NCCLWeightTransferEngine
 
         self._request_prefix = f"chito-{uuid.uuid4().hex}"
         self._request_ids = itertools.count()
@@ -155,9 +180,8 @@ class VllmBackend:
     async def update_weights(
         self, update: object, *, new_policy_version: int
     ) -> None:
-        """Synchronously reload one complete local checkpoint into vLLM."""
-        if not isinstance(update, VllmCheckpointWeightUpdate):
-            raise TypeError("update must be a VllmCheckpointWeightUpdate")
+        """Synchronously replace vLLM weights before admitting new rollout."""
+        self._validate_update_type(update)
         if not isinstance(new_policy_version, int) or isinstance(
             new_policy_version, bool
         ):
@@ -166,38 +190,128 @@ class VllmBackend:
             raise ValueError("new_policy_version must be non-negative")
 
         async with self._weight_update_lock:
-            checkpoint_path = Path(update.checkpoint_path)
-            _validate_checkpoint_directory(checkpoint_path)
+            if isinstance(update, VllmCheckpointWeightUpdate):
+                _validate_checkpoint_directory(Path(update.checkpoint_path))
+            else:
+                self._validate_nccl_device(update)
             await self._begin_weight_update()
             failure: BaseException | None = None
             try:
-                await self._engine.pause_generation(mode="wait", clear_cache=True)
-                reload_task = asyncio.create_task(
-                    self._engine.collective_rpc(
-                        "reload_weights",
-                        kwargs={
-                            "weights_path": str(checkpoint_path),
-                            "is_checkpoint_format": True,
-                        },
-                    )
-                )
+                update_task = asyncio.create_task(self._apply_weight_update(update))
                 try:
-                    await asyncio.shield(reload_task)
+                    await asyncio.shield(update_task)
                 except asyncio.CancelledError as cancellation:
                     try:
-                        await reload_task
-                    except BaseException as reload_error:
+                        await update_task
+                    except BaseException as update_error:
                         raise BaseExceptionGroup(
-                            "checkpoint reload failed while update was cancelled",
-                            [cancellation, reload_error],
+                            "weight update failed while it was cancelled",
+                            [cancellation, update_error],
                         ) from cancellation
                     raise
-                await self._engine.resume_generation()
             except BaseException as exc:
                 failure = exc
                 raise
             finally:
                 await self._end_weight_update(failure)
+
+    def _validate_update_type(self, update: object) -> None:
+        expected = (
+            VllmNcclWeightUpdate
+            if self._weight_transfer == "nccl"
+            else VllmCheckpointWeightUpdate
+        )
+        if not isinstance(update, expected):
+            raise TypeError(
+                f"{self._weight_transfer} transfer requires {expected.__name__}"
+            )
+
+    def _validate_nccl_device(self, update: VllmNcclWeightUpdate) -> None:
+        device = update.named_weights[0][1].device
+        if device.type != "cuda":
+            raise ValueError("NCCL weights must be CUDA tensors")
+        if any(weight.device != device for _, weight in update.named_weights):
+            raise ValueError("all NCCL weights must be on the same CUDA device")
+        if self._nccl_device is not None and device != self._nccl_device:
+            raise ValueError("NCCL trainer device cannot change after initialization")
+
+    async def _apply_weight_update(
+        self, update: VllmNcclWeightUpdate | VllmCheckpointWeightUpdate
+    ) -> None:
+        await self._engine.pause_generation(mode="wait", clear_cache=True)
+        if isinstance(update, VllmCheckpointWeightUpdate):
+            await self._reload_checkpoint(update)
+        else:
+            await self._broadcast_nccl_weights(update)
+        await self._engine.resume_generation()
+
+    async def _reload_checkpoint(self, update: VllmCheckpointWeightUpdate) -> None:
+        await self._engine.collective_rpc(
+            "reload_weights",
+            kwargs={
+                "weights_path": str(update.checkpoint_path),
+                "is_checkpoint_format": True,
+            },
+        )
+
+    async def _broadcast_nccl_weights(self, update: VllmNcclWeightUpdate) -> None:
+        device = update.named_weights[0][1].device
+        await self._ensure_nccl_group(device)
+        await self._engine.start_weight_update(is_checkpoint_format=True)
+
+        update_request = self._weight_transfer_update_request(
+            update_info={
+                "names": [name for name, _ in update.named_weights],
+                "dtype_names": [
+                    str(weight.dtype).removeprefix("torch.")
+                    for _, weight in update.named_weights
+                ],
+                "shapes": [
+                    list(weight.shape) for _, weight in update.named_weights
+                ],
+                "packed": False,
+            }
+        )
+        await asyncio.gather(
+            self._engine.update_weights(update_request),
+            asyncio.to_thread(self._send_nccl_weights, update),
+        )
+        await self._engine.finish_weight_update()
+
+    async def _ensure_nccl_group(self, device: Any) -> None:
+        if self._nccl_group is not None:
+            return
+
+        init_info = {
+            "master_address": "127.0.0.1",
+            "master_port": _unused_local_port(),
+            "rank_offset": 1,
+            "world_size": self._inference_world_size + 1,
+        }
+        request = self._weight_transfer_init_request(init_info=init_info)
+        receiver_init = self._engine.init_weight_transfer_engine(request)
+        trainer_info = {
+            "master_address": init_info["master_address"],
+            "master_port": init_info["master_port"],
+            "world_size": init_info["world_size"],
+        }
+        _, group = await asyncio.gather(
+            receiver_init,
+            asyncio.to_thread(self._init_nccl_trainer, device, trainer_info),
+        )
+        self._nccl_group = group
+        self._nccl_device = device
+
+    def _init_nccl_trainer(self, device: Any, init_info: dict[str, Any]) -> Any:
+        self._torch.cuda.set_device(device)
+        return self._nccl_engine.trainer_init(init_info)
+
+    def _send_nccl_weights(self, update: VllmNcclWeightUpdate) -> None:
+        self._torch.cuda.set_device(self._nccl_device)
+        self._nccl_engine.trainer_send_weights(
+            iter(update.named_weights),
+            self._nccl_send_args(group=self._nccl_group, packed=False),
+        )
 
     async def aclose(self) -> None:
         """Wait for admitted operations and release vLLM resources once."""
@@ -218,6 +332,7 @@ class VllmBackend:
         try:
             self._engine.shutdown()
         finally:
+            self._nccl_group = None
             async with self._lifecycle:
                 self._closed = True
                 self._lifecycle.notify_all()
@@ -305,3 +420,9 @@ def _validate_checkpoint_directory(path: Path) -> None:
         raise FileNotFoundError(f"checkpoint directory does not exist: {path}")
     if not path.is_dir():
         raise NotADirectoryError(f"checkpoint path is not a directory: {path}")
+
+
+def _unused_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
