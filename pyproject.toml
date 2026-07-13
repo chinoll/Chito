@@ -15,6 +15,12 @@ dependencies = []
 [project.optional-dependencies]
 test = ["pytest>=8"]
 vllm = ["vllm>=0.25,<0.26", "ray>=2.48,<3"]
+train = [
+    "accelerate>=1.13,<2",
+    "datasets>=4,<6",
+    "deepspeed>=0.19,<0.20",
+    "transformers>=5,<6",
+]
 
 [tool.pytest.ini_options]
 addopts = "-q"
