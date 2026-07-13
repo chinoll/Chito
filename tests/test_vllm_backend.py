@@ -456,6 +456,23 @@ def test_nccl_failure_waits_for_sender_before_poisoning(fake_vllm) -> None:
     asyncio.run(scenario())
 
 
+def test_failed_nccl_init_destroys_trainer_group(fake_vllm) -> None:
+    async def scenario() -> None:
+        backend = VllmBackend("model-id")
+        fake_engine = FakeAsyncLLMEngine.instance
+        fake_engine.failures["init"] = 1
+        update = VllmNcclWeightUpdate([("model.a", FakeTensor((1,)))])
+
+        with pytest.raises(RuntimeError, match="init failed"):
+            await backend.update_weights(update, new_policy_version=1)
+
+        assert FakeNCCLEngine.group.destroy_count == 1
+        await backend.aclose()
+        assert FakeNCCLEngine.group.destroy_count == 1
+
+    asyncio.run(scenario())
+
+
 def test_transfer_mode_requires_matching_update_type(fake_vllm) -> None:
     async def scenario() -> None:
         nccl_backend = VllmBackend("model-id")

@@ -296,10 +296,18 @@ class VllmBackend:
             "master_port": init_info["master_port"],
             "world_size": init_info["world_size"],
         }
-        _, group = await self._wait_for_operations(
+        results = await asyncio.gather(
             receiver_init,
             asyncio.to_thread(self._init_nccl_trainer, device, trainer_info),
+            return_exceptions=True,
         )
+        group = results[1]
+        try:
+            self._raise_operation_errors(results)
+        except BaseException:
+            if not isinstance(group, BaseException):
+                group.destroy()
+            raise
         self._nccl_group = group
         self._nccl_device = device
 
@@ -319,12 +327,16 @@ class VllmBackend:
         first: Awaitable[Any], second: Awaitable[Any]
     ) -> tuple[Any, Any]:
         results = await asyncio.gather(first, second, return_exceptions=True)
+        VllmBackend._raise_operation_errors(results)
+        return results[0], results[1]
+
+    @staticmethod
+    def _raise_operation_errors(results: Sequence[Any]) -> None:
         errors = [result for result in results if isinstance(result, BaseException)]
         if len(errors) == 1:
             raise errors[0]
         if errors:
             raise BaseExceptionGroup("concurrent weight transfer failed", errors)
-        return results[0], results[1]
 
     async def aclose(self) -> None:
         """Wait for admitted operations and release vLLM resources once."""
