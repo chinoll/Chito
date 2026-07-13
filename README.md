@@ -5,9 +5,8 @@ It overlaps complete-group rollout production with training-batch consumption an
 switches inference weights only at group boundaries.
 
 V1 requires Python 3.11 or newer. Its optional `VllmBackend` implements the
-`InferenceBackend` boundary with vLLM's asynchronous Python engine. Other
-inference systems can implement the same small protocol without changing the
-rollout engine.
+`InferenceBackend` boundary with vLLM. Other inference systems can implement the
+same small protocol without changing the rollout engine.
 
 ## Core semantics
 
@@ -94,7 +93,7 @@ VENV_PATH="${VENV_PATH:-.venv-vllm}"
 uv venv --python 3.12 "$VENV_PATH"
 uv pip install --python "$VENV_PATH/bin/python" \
   vllm==0.24.0 --torch-backend=cu129
-uv pip install --python "$VENV_PATH/bin/python" -e '.[test]'
+uv pip install --python "$VENV_PATH/bin/python" -e '.[test,vllm]'
 ```
 
 The adapter targets vLLM 0.24's asynchronous engine and public weight-transfer
@@ -102,8 +101,8 @@ API. The optional dependency is bounded below by 0.24 and below the next
 unverified 0.25 release.
 
 Constructing `VllmBackend` loads the model. Generation passes the exact prompt
-token IDs to vLLM, requests the sampled-token logprob at every generated
-position, and lets vLLM schedule concurrent asynchronous requests:
+token IDs to vLLM and requests the sampled-token logprob at every generated
+position. The default NCCL mode uses vLLM's asynchronous engine:
 
 ```python
 from chito import VllmBackend
@@ -130,9 +129,9 @@ use a different GPU from the inference workers. Submit the trainer's checkpoint-
 format named parameters after each optimizer step:
 
 ```python
-from chito import VllmNcclWeightUpdate
+from chito import VllmWeightUpdate
 
-update = VllmNcclWeightUpdate(
+update = VllmWeightUpdate(
     trainer.named_parameters(),
 )
 new_policy_version = await engine.update_weights(update)
@@ -145,8 +144,33 @@ updates reuse that group. Each update pauses generation, runs vLLM's public
 resumes only after every worker has loaded the new weights. V1 assumes the
 trainer and inference workers are on the same machine.
 
-For a single-GPU setup, explicitly select the checkpoint fallback and save each
-policy to a new immutable directory:
+For a single-GPU setup, expose exactly one GPU before starting Python and select
+IPC mode:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train.py
+```
+
+```python
+from chito import VllmBackend, VllmWeightUpdate
+
+backend = VllmBackend(model, weight_transfer="ipc")
+
+# The trainer stays in the driver process.
+optimizer.step()
+new_policy_version = await engine.update_weights(
+    VllmWeightUpdate(trainer.named_parameters())
+)
+```
+
+The backend privately owns the local Ray runtime, placement group, and
+synchronous vLLM `LLM` actor. `generate()` remains awaitable, but V1 serializes
+separate calls through that actor and does not provide continuous batching
+across calls. The backend chooses the packed IPC buffer size as the larger of
+vLLM's default and the largest submitted tensor.
+
+Checkpoint reload remains available when IPC is unsuitable. Save each policy
+to a new immutable directory:
 
 ```python
 from chito import VllmBackend, VllmCheckpointWeightUpdate
@@ -225,25 +249,26 @@ producers and consumers, and closes the backend exactly once.
 ## Samples
 
 [`samples/train_grpo.py`](samples/train_grpo.py) is a minimal educational
-single-GPU clipped-GRPO loop. Ray colocates the trainer and a synchronous vLLM
-actor on one GPU, and each optimizer step updates vLLM directly through packed
-CUDA IPC handles instead of writing a checkpoint:
+single-GPU BF16 clipped-GRPO loop. The trainer stays in the driver process, and
+each optimizer step updates vLLM through packed CUDA IPC handles. The script
+does not import Ray or manage actors, placement groups, or IPC buffers; all Ray
+details stay inside `VllmBackend`:
 
 ```bash
 python -m pip install -e '.[vllm]'
 python samples/train_grpo.py
 ```
 
-Set `CUDA_VISIBLE_DEVICES` to select the physical GPU. Set `CHITO_MODEL` when
-the model is already available in a local directory:
+`CUDA_VISIBLE_DEVICES` must expose exactly one physical GPU. Set `CHITO_MODEL`
+when the model is already available in a local directory:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 CHITO_MODEL=/models/Qwen2.5-0.5B-Instruct \
   python samples/train_grpo.py
 ```
 
-The packed IPC buffer must be at least as large as the model's largest tensor.
-The sample uses 320 MiB for Qwen2.5-0.5B.
+The backend automatically sizes its packed IPC buffer from vLLM's default and
+the model's largest tensor.
 
 ## Tests
 
