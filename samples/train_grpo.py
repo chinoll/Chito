@@ -1,4 +1,4 @@
-"""Minimal end-to-end GRPO training loop with vLLM rollouts."""
+"""Minimal two-GPU GRPO training with vLLM NCCL weight updates."""
 
 from __future__ import annotations
 
@@ -124,9 +124,10 @@ async def main() -> None:
         max_tokens=MAX_NEW_TOKENS,
         temperature=1.0,
         top_p=1.0,
-        weight_transfer="ipc",
+        weight_transfer="nccl",
         engine_kwargs={
             "dtype": "bfloat16",
+            "device_ids": [1],
             "enforce_eager": True,
             "gpu_memory_utilization": 0.4,
             "max_model_len": 512,
