@@ -1,5 +1,6 @@
-"""Asynchronous rollout coordination for reinforcement learning."""
+"""A small GRPO rollout service for distributed training."""
 
+from .engine import RolloutEngine
 from .models import (
     InferenceRequest,
     InferenceResult,
@@ -8,56 +9,26 @@ from .models import (
     RolloutPrompt,
     RolloutSample,
     TrainingBatch,
+    TrainingSample,
 )
-from .engine import RolloutEngine
-from .errors import (
-    EngineClosedError,
-    InvalidRolloutGroupError,
-    RolloutAlreadyStartedError,
-    RolloutError,
-    RolloutFailedError,
-    RolloutNotStartedError,
-    SourceExhaustedError,
-)
-from .protocols import (
-    GroupPostHook,
-    InferenceBackend,
-    RewardFunction,
-    RolloutContext,
-    RolloutWorkflow,
-)
-from .workflows import SingleTurnWorkflow
-from .vllm_backend import (
-    VllmBackend,
-    VllmBackendPoisonedError,
-    VllmCheckpointWeightUpdate,
-)
+from .protocols import InferenceBackend, RolloutContext, RolloutWorkflow
+from .workflows import GRPOWorkflow, SingleTurnWorkflow
 
 __version__ = "0.1.0"
 
 __all__ = [
-    "GroupPostHook",
-    "EngineClosedError",
+    "GRPOWorkflow",
     "InferenceBackend",
     "InferenceRequest",
     "InferenceResult",
-    "InvalidRolloutGroupError",
-    "RewardFunction",
     "RolloutConfig",
     "RolloutContext",
-    "RolloutAlreadyStartedError",
     "RolloutEngine",
-    "RolloutError",
-    "RolloutFailedError",
     "RolloutGroup",
     "RolloutPrompt",
-    "RolloutNotStartedError",
     "RolloutSample",
     "RolloutWorkflow",
     "SingleTurnWorkflow",
-    "SourceExhaustedError",
     "TrainingBatch",
-    "VllmBackend",
-    "VllmBackendPoisonedError",
-    "VllmCheckpointWeightUpdate",
+    "TrainingSample",
 ]

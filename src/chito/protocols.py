@@ -1,4 +1,4 @@
-"""Backend, workflow, reward, and post-processing contracts."""
+"""Small contracts used at the Workflow/backend boundary."""
 
 from __future__ import annotations
 
@@ -16,20 +16,16 @@ from .models import (
 
 @runtime_checkable
 class InferenceBackend(Protocol):
-    """Backend boundary implemented by a vLLM or SGLang adapter."""
+    """Generation API exposed to a Workflow inside the rollout service."""
 
     async def generate(self, request: InferenceRequest) -> InferenceResult: ...
-
-    async def update_weights(
-        self, update: object, *, new_policy_version: int
-    ) -> None: ...
 
     async def aclose(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
 class RolloutContext:
-    """Per-sample context supplied by the engine to a workflow."""
+    """Per-completion state supplied by the service."""
 
     backend: InferenceBackend
     sample_index: int
@@ -38,24 +34,20 @@ class RolloutContext:
 
 @runtime_checkable
 class RolloutWorkflow(Protocol):
-    """Produces one unrewarded sample; the engine owns grouping and rewards."""
+    """Task and algorithm behavior owned by the rollout service."""
+
+    async def setup(self) -> None: ...
+
+    async def prepare(self, item: object, item_id: str) -> RolloutPrompt: ...
 
     async def run(
         self, context: RolloutContext, prompt: RolloutPrompt
     ) -> RolloutSample: ...
 
+    async def reward(self, prompt: RolloutPrompt, sample: RolloutSample) -> float: ...
 
-@runtime_checkable
-class RewardFunction(Protocol):
-    """Asynchronously scores one completed sample."""
+    async def postprocess(self, group: RolloutGroup) -> RolloutGroup | None: ...
 
-    async def __call__(
-        self, prompt: RolloutPrompt, sample: RolloutSample
-    ) -> float: ...
+    async def compute_advantages(self, group: RolloutGroup) -> tuple[float, ...]: ...
 
-
-@runtime_checkable
-class GroupPostHook(Protocol):
-    """Accepts, replaces, or rejects one complete rewarded group."""
-
-    async def __call__(self, group: RolloutGroup) -> RolloutGroup | None: ...
+    async def aclose(self) -> None: ...

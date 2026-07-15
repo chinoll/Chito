@@ -1,13 +1,14 @@
-"""Immutable values exchanged by rollout components."""
+"""Public values exchanged by rollout and training processes."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Literal
 
 
-def _as_int_tuple(values: tuple[int, ...], name: str) -> tuple[int, ...]:
+def _int_tuple(values: tuple[int, ...], name: str) -> tuple[int, ...]:
     result = tuple(values)
     if any(not isinstance(value, int) or isinstance(value, bool) for value in result):
         raise TypeError(f"{name} must contain only integers")
@@ -18,7 +19,7 @@ def _as_int_tuple(values: tuple[int, ...], name: str) -> tuple[int, ...]:
 
 @dataclass(frozen=True, slots=True)
 class RolloutPrompt:
-    """A tokenized prompt with a stable identity."""
+    """A tokenized prompt prepared from one dataset item."""
 
     prompt_id: str
     token_ids: tuple[int, ...]
@@ -27,15 +28,13 @@ class RolloutPrompt:
     def __post_init__(self) -> None:
         if not self.prompt_id:
             raise ValueError("prompt_id must not be empty")
-        object.__setattr__(
-            self, "token_ids", _as_int_tuple(self.token_ids, "prompt.token_ids")
-        )
+        object.__setattr__(self, "token_ids", _int_tuple(self.token_ids, "token_ids"))
         object.__setattr__(self, "metadata", dict(self.metadata))
 
 
 @dataclass(frozen=True, slots=True)
 class InferenceRequest:
-    """One backend generation request."""
+    """One generation request sent from a Workflow to the backend."""
 
     prompt: RolloutPrompt
     sample_index: int
@@ -50,19 +49,23 @@ class InferenceRequest:
 
 @dataclass(frozen=True, slots=True)
 class InferenceResult:
-    """Exact output tokens and behavior log-probabilities from a backend."""
+    """Exact completion tokens and their behavior log-probabilities."""
 
     output_token_ids: tuple[int, ...]
     output_logprobs: tuple[float, ...]
     policy_version: int
 
     def __post_init__(self) -> None:
-        tokens = _as_int_tuple(self.output_token_ids, "output_token_ids")
+        tokens = _int_tuple(self.output_token_ids, "output_token_ids")
         logprobs = tuple(float(value) for value in self.output_logprobs)
         if not tokens:
             raise ValueError("inference output must contain at least one token")
         if len(tokens) != len(logprobs):
-            raise ValueError("output_token_ids and output_logprobs must have equal length")
+            raise ValueError(
+                "output_token_ids and output_logprobs must have equal length"
+            )
+        if any(not math.isfinite(value) for value in logprobs):
+            raise ValueError("output_logprobs must be finite")
         if self.policy_version < 0:
             raise ValueError("policy_version must be non-negative")
         object.__setattr__(self, "output_token_ids", tokens)
@@ -71,7 +74,7 @@ class InferenceResult:
 
 @dataclass(frozen=True, slots=True)
 class RolloutSample:
-    """One training sample; reward is populated by the engine."""
+    """One completion during rollout; reward is filled by the service."""
 
     prompt_id: str
     sample_index: int
@@ -82,7 +85,7 @@ class RolloutSample:
     reward: float | None = None
 
     def __post_init__(self) -> None:
-        tokens = _as_int_tuple(self.token_ids, "sample.token_ids")
+        tokens = _int_tuple(self.token_ids, "token_ids")
         logprobs = tuple(float(value) for value in self.logprobs)
         loss_mask = tuple(bool(value) for value in self.loss_mask)
         if not self.prompt_id:
@@ -90,7 +93,11 @@ class RolloutSample:
         if self.sample_index < 0:
             raise ValueError("sample_index must be non-negative")
         if len(tokens) != len(logprobs) or len(tokens) != len(loss_mask):
-            raise ValueError("token_ids, logprobs, and loss_mask must have equal length")
+            raise ValueError(
+                "token_ids, logprobs, and loss_mask must have equal length"
+            )
+        if any(not math.isfinite(value) for value in logprobs):
+            raise ValueError("logprobs must be finite")
         if not any(loss_mask):
             raise ValueError("loss_mask must select at least one generated token")
         if self.policy_version < 0:
@@ -106,7 +113,7 @@ class RolloutSample:
 
 @dataclass(frozen=True, slots=True)
 class RolloutGroup:
-    """A complete GRPO group generated from one prompt and policy version."""
+    """A complete, rewarded GRPO group from one prompt."""
 
     prompt: RolloutPrompt
     samples: tuple[RolloutSample, ...]
@@ -122,50 +129,153 @@ class RolloutGroup:
             if sample.reward is None:
                 raise ValueError("every grouped sample must have a reward")
             if sample.prompt_id != self.prompt.prompt_id:
-                raise ValueError("every grouped sample must match the group prompt_id")
+                raise ValueError("grouped samples must match the prompt_id")
             if sample.policy_version != self.policy_version:
-                raise ValueError("all grouped samples must use the group policy_version")
+                raise ValueError("grouped samples must use the group policy_version")
         object.__setattr__(self, "samples", samples)
 
 
 @dataclass(frozen=True, slots=True)
-class TrainingBatch:
-    """Exactly ``train_batch_size`` accepted rollout groups."""
+class TrainingSample:
+    """One rollout sample after its complete group advantage is computed."""
 
-    groups: tuple[RolloutGroup, ...]
+    prompt_id: str
+    sample_index: int
+    token_ids: tuple[int, ...]
+    logprobs: tuple[float, ...]
+    loss_mask: tuple[bool, ...]
+    reward: float
+    advantage: float
+    policy_version: int
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        groups = tuple(self.groups)
-        if not groups:
-            raise ValueError("training batch must contain at least one group")
-        object.__setattr__(self, "groups", groups)
+        tokens = _int_tuple(self.token_ids, "token_ids")
+        logprobs = tuple(float(value) for value in self.logprobs)
+        loss_mask = tuple(bool(value) for value in self.loss_mask)
+        if not self.prompt_id:
+            raise ValueError("prompt_id must not be empty")
+        if self.sample_index < 0:
+            raise ValueError("sample_index must be non-negative")
+        if len(tokens) != len(logprobs) or len(tokens) != len(loss_mask):
+            raise ValueError(
+                "token_ids, logprobs, and loss_mask must have equal length"
+            )
+        if any(not math.isfinite(value) for value in logprobs):
+            raise ValueError("logprobs must be finite")
+        if not any(loss_mask):
+            raise ValueError("loss_mask must select at least one generated token")
+        if not math.isfinite(float(self.reward)):
+            raise ValueError("reward must be finite")
+        if not math.isfinite(float(self.advantage)):
+            raise ValueError("advantage must be finite")
+        if self.policy_version < 0:
+            raise ValueError("policy_version must be non-negative")
+        object.__setattr__(self, "token_ids", tokens)
+        object.__setattr__(self, "logprobs", logprobs)
+        object.__setattr__(self, "loss_mask", loss_mask)
+        object.__setattr__(self, "reward", float(self.reward))
+        object.__setattr__(self, "advantage", float(self.advantage))
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingBatch:
+    """The fixed contiguous sample shard returned to one training rank."""
+
+    batch_id: int
+    policy_version: int
+    samples: tuple[TrainingSample, ...]
+    global_sample_count: int
+
+    def __post_init__(self) -> None:
+        samples = tuple(self.samples)
+        if self.batch_id < 0:
+            raise ValueError("batch_id must be non-negative")
+        if self.policy_version < 0:
+            raise ValueError("policy_version must be non-negative")
+        if not samples:
+            raise ValueError("training batch must contain at least one sample")
+        if self.global_sample_count < len(samples):
+            raise ValueError(
+                "global_sample_count cannot be smaller than the local shard"
+            )
+        if any(sample.policy_version != self.policy_version for sample in samples):
+            raise ValueError("all samples must match the batch policy_version")
+        object.__setattr__(self, "samples", samples)
 
 
 @dataclass(frozen=True, slots=True)
 class RolloutConfig:
-    """Fixed V1 concurrency and GRPO batching settings."""
+    """Flat V1 configuration for one synchronous GRPO rollout service."""
 
+    model: str
     group_size: int
-    train_batch_size: int
+    per_device_train_batch_size: int
     max_concurrent_groups: int
-    prefetch_batches: int = 1
+    max_tokens: int = 512
+    temperature: float = 1.0
+    top_p: float = 1.0
+    backend: Literal["vllm"] = "vllm"
+    weight_transfer: Literal["nccl"] = "nccl"
+    rollout_mode: Literal["sync"] = "sync"
+    rollout_gpu_ids: tuple[int, ...] = ()
+    shuffle: bool = True
+    seed: int = 0
     initial_policy_version: int = 0
+    backend_kwargs: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not self.model:
+            raise ValueError("model must not be empty")
         positive = {
             "group_size": self.group_size,
-            "train_batch_size": self.train_batch_size,
+            "per_device_train_batch_size": self.per_device_train_batch_size,
             "max_concurrent_groups": self.max_concurrent_groups,
-            "prefetch_batches": self.prefetch_batches,
+            "max_tokens": self.max_tokens,
         }
         for name, value in positive.items():
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
         if self.group_size < 2:
-            raise ValueError("group_size must be at least 2 for GRPO rollout")
+            raise ValueError("group_size must be at least 2 for GRPO")
+        if self.temperature < 0:
+            raise ValueError("temperature must be non-negative")
+        if not 0 < self.top_p <= 1:
+            raise ValueError("top_p must be in the interval (0, 1]")
+        if self.backend != "vllm":
+            raise ValueError("V1 only supports backend='vllm'")
+        if self.weight_transfer != "nccl":
+            raise ValueError("V1 only supports weight_transfer='nccl'")
+        if self.rollout_mode != "sync":
+            raise ValueError("V1 only supports rollout_mode='sync'")
+        if self.seed < 0:
+            raise ValueError("seed must be non-negative")
         if self.initial_policy_version < 0:
             raise ValueError("initial_policy_version must be non-negative")
 
-    @property
-    def accepted_queue_capacity(self) -> int:
-        return self.train_batch_size * self.prefetch_batches
+        gpu_ids = _int_tuple(tuple(self.rollout_gpu_ids), "rollout_gpu_ids")
+        if len(set(gpu_ids)) != len(gpu_ids):
+            raise ValueError("rollout_gpu_ids must not contain duplicates")
+        kwargs = dict(self.backend_kwargs)
+        reserved = {
+            "model",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "device_ids",
+            "weight_transfer_config",
+        }
+        duplicate = reserved.intersection(kwargs)
+        if duplicate:
+            names = ", ".join(sorted(duplicate))
+            raise ValueError(f"pass {names} through RolloutConfig fields")
+        object.__setattr__(self, "rollout_gpu_ids", gpu_ids)
+        object.__setattr__(self, "backend_kwargs", kwargs)
+
+    def global_sample_count(self, train_world_size: int) -> int:
+        if train_world_size <= 0:
+            raise ValueError("train_world_size must be positive")
+        return self.per_device_train_batch_size * train_world_size

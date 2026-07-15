@@ -1,127 +1,69 @@
-"""vLLM backend for token-exact generation and synchronous weight updates."""
+"""vLLM generation and the receiver half of NCCL weight updates."""
 
 from __future__ import annotations
 
 import asyncio
 import itertools
 import os
-import socket
 import uuid
-from collections.abc import Awaitable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Literal
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from .models import InferenceRequest, InferenceResult
 
 
-@dataclass(frozen=True, slots=True)
-class VllmCheckpointWeightUpdate:
-    """A complete local checkpoint to load before the next rollout version."""
-
-    checkpoint_path: str | os.PathLike[str]
-
-    def __post_init__(self) -> None:
-        if isinstance(self.checkpoint_path, str) and not self.checkpoint_path:
-            raise ValueError("checkpoint_path must not be empty")
-
-        path = Path(self.checkpoint_path).expanduser().resolve()
-        _validate_checkpoint_directory(path)
-        object.__setattr__(self, "checkpoint_path", path)
-
-
 class VllmBackendPoisonedError(RuntimeError):
-    """The loaded engine may contain a partial update and must be reloaded."""
+    """A partial weight update made the loaded inference model unsafe."""
 
     def __init__(self, cause: BaseException) -> None:
-        super().__init__(
-            "VllmBackend is poisoned by a failed weight update; "
-            "close it and load a fresh backend"
-        )
         self.cause = cause
+        super().__init__(
+            "vLLM failed during a weight update; close the rollout service"
+        )
 
 
 class VllmBackend:
-    """Load one model with a vLLM Python engine.
-
-    vLLM is imported only while constructing this backend, so the rest of
-    :mod:`chito` remains usable without the optional dependency installed.
-    """
+    """Own vLLM inside the rollout service process."""
 
     def __init__(
         self,
         model: str,
         *,
-        max_tokens: int = 128,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        weight_transfer: Literal["ipc", "nccl", "checkpoint"] = "nccl",
-        engine_kwargs: Mapping[str, object] | None = None,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        engine_kwargs: Mapping[str, object],
     ) -> None:
-        if not model:
-            raise ValueError("model must not be empty")
-        if not isinstance(max_tokens, int) or isinstance(max_tokens, bool):
-            raise TypeError("max_tokens must be an integer")
-        if max_tokens <= 0:
-            raise ValueError("max_tokens must be positive")
-        if temperature < 0:
-            raise ValueError("temperature must be non-negative")
-        if not 0 < top_p <= 1:
-            raise ValueError("top_p must be in the interval (0, 1]")
-
-        options = dict(engine_kwargs or {})
-        if "model" in options:
-            raise ValueError("pass model directly instead of through engine_kwargs")
-        if "weight_transfer_config" in options:
-            raise ValueError(
-                "pass weight_transfer directly instead of weight_transfer_config"
-            )
-        if weight_transfer not in {"ipc", "nccl", "checkpoint"}:
-            raise ValueError(
-                "weight_transfer must be 'ipc', 'nccl', or 'checkpoint'"
-            )
-        if weight_transfer == "nccl":
-            _validate_nccl_topology(options)
-            options["weight_transfer_config"] = {"backend": "nccl"}
+        options = dict(engine_kwargs)
+        options["logprobs_mode"] = "processed_logprobs"
+        options["weight_transfer_config"] = {"backend": "nccl"}
 
         try:
-            from vllm import SamplingParams, TokensPrompt
-
-            if weight_transfer == "ipc":
-                from ._vllm_ipc import VllmIpcRuntime
-            else:
-                from vllm import AsyncEngineArgs, AsyncLLMEngine
-
-            if weight_transfer == "nccl":
-                import torch
-                from vllm.distributed.weight_transfer.base import (
-                    WeightTransferInitRequest,
-                    WeightTransferUpdateRequest,
-                )
-                from vllm.distributed.weight_transfer.nccl_engine import (
-                    NCCLTrainerSendWeightsArgs,
-                    NCCLWeightTransferEngine,
-                )
+            from vllm import (
+                AsyncEngineArgs,
+                AsyncLLMEngine,
+                SamplingParams,
+                TokensPrompt,
+            )
+            from vllm.distributed.weight_transfer.base import (
+                WeightTransferInitRequest,
+                WeightTransferUpdateRequest,
+            )
         except ModuleNotFoundError as exc:
             if exc.name != "vllm":
                 raise
             raise ModuleNotFoundError(
-                "VllmBackend requires the optional 'vllm' dependency; "
-                "install chito[vllm]"
+                "the rollout service requires chito[vllm]"
             ) from exc
 
-        if weight_transfer == "ipc":
-            self._engine: Any = VllmIpcRuntime(model, options)
-        else:
-            engine_args = AsyncEngineArgs(model=model, **options)
-            agent_store = os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
-            try:
-                self._engine = AsyncLLMEngine.from_engine_args(engine_args)
-            finally:
-                if agent_store is None:
-                    os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
-                else:
-                    os.environ["TORCHELASTIC_USE_AGENT_STORE"] = agent_store
+        engine_args = AsyncEngineArgs(model=model, **options)
+        agent_store = os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
+        try:
+            self._engine: Any = AsyncLLMEngine.from_engine_args(engine_args)
+        finally:
+            if agent_store is not None:
+                os.environ["TORCHELASTIC_USE_AGENT_STORE"] = agent_store
+
         self._sampling_params: Any = SamplingParams(
             n=1,
             max_tokens=max_tokens,
@@ -131,33 +73,31 @@ class VllmBackend:
             detokenize=False,
         )
         self._tokens_prompt = TokensPrompt
-        self._weight_transfer = weight_transfer
+        self._init_request = WeightTransferInitRequest
+        self._update_request = WeightTransferUpdateRequest
         self._inference_world_size = (
             int(options.get("data_parallel_size", 1))
             * int(options.get("pipeline_parallel_size", 1))
             * int(options.get("tensor_parallel_size", 1))
         )
-        self._nccl_group: Any = None
-        self._nccl_device: Any = None
-        if weight_transfer == "nccl":
-            self._torch = torch
-            self._weight_transfer_init_request = WeightTransferInitRequest
-            self._weight_transfer_update_request = WeightTransferUpdateRequest
-            self._nccl_send_args = NCCLTrainerSendWeightsArgs
-            self._nccl_engine = NCCLWeightTransferEngine
 
         self._request_prefix = f"chito-{uuid.uuid4().hex}"
         self._request_ids = itertools.count()
-        self._lifecycle = asyncio.Condition()
-        self._weight_update_lock = asyncio.Lock()
+        self._condition = asyncio.Condition()
         self._active_requests = 0
-        self._weight_update_in_progress = False
+        self._updating = False
+        self._channel_initialized = False
+        self._receive_task: asyncio.Task[Any] | None = None
         self._poisoned: BaseException | None = None
         self._closing = False
         self._closed = False
 
+    @property
+    def inference_world_size(self) -> int:
+        return self._inference_world_size
+
     async def generate(self, request: InferenceRequest) -> InferenceResult:
-        """Generate from the request's exact prompt IDs and preserve logprobs."""
+        """Generate from exact token IDs and keep sampled-token logprobs."""
         if not isinstance(request, InferenceRequest):
             raise TypeError("request must be an InferenceRequest")
 
@@ -166,287 +106,123 @@ class VllmBackend:
             prompt = self._tokens_prompt(
                 prompt_token_ids=list(request.prompt.token_ids)
             )
-            if self._weight_transfer == "ipc":
-                final_output = await self._engine.generate(
-                    prompt, self._sampling_params
-                )
-            else:
-                request_id = f"{self._request_prefix}-{next(self._request_ids)}"
-                final_output = None
-                async for output in self._engine.generate(
-                    prompt,
-                    self._sampling_params,
-                    request_id,
-                ):
-                    final_output = output
+            request_id = f"{self._request_prefix}-{next(self._request_ids)}"
+            final_output = None
+            async for output in self._engine.generate(
+                prompt, self._sampling_params, request_id
+            ):
+                final_output = output
             return self._to_result(final_output, request)
         finally:
             await self._finish_request()
 
-    async def update_weights(
-        self, update: object, *, new_policy_version: int
-    ) -> None:
-        """Synchronously replace vLLM weights before admitting new rollout."""
-        if not isinstance(new_policy_version, int) or isinstance(
-            new_policy_version, bool
-        ):
-            raise TypeError("new_policy_version must be an integer")
-        if new_policy_version < 0:
-            raise ValueError("new_policy_version must be non-negative")
-        prepared_update = self._prepare_weight_update(update)
+    async def init_weight_channel(self, init_info: Mapping[str, object]) -> None:
+        """Join the persistent NCCL communicator as the vLLM receivers."""
+        if self._channel_initialized:
+            raise RuntimeError("weight channel is already initialized")
+        request = self._init_request(init_info=dict(init_info))
+        await self._engine.init_weight_transfer_engine(request)
+        self._channel_initialized = True
 
-        async with self._weight_update_lock:
-            if isinstance(prepared_update, VllmCheckpointWeightUpdate):
-                _validate_checkpoint_directory(
-                    Path(prepared_update.checkpoint_path)
-                )
-            else:
-                self._validate_weight_device(prepared_update)
-            await self._begin_weight_update()
-            failure: BaseException | None = None
-            try:
-                update_task = asyncio.create_task(
-                    self._apply_weight_update(prepared_update)
-                )
-                try:
-                    await asyncio.shield(update_task)
-                except asyncio.CancelledError as cancellation:
-                    try:
-                        await update_task
-                    except BaseException as update_error:
-                        raise BaseExceptionGroup(
-                            "weight update failed while it was cancelled",
-                            [cancellation, update_error],
-                        ) from cancellation
-                    raise
-            except BaseException as exc:
-                failure = exc
-                raise
-            finally:
-                await self._end_weight_update(failure)
-
-    def _prepare_weight_update(
-        self,
-        update: object,
-    ) -> VllmCheckpointWeightUpdate | tuple[tuple[str, Any], ...]:
-        if self._weight_transfer == "checkpoint":
-            if isinstance(update, VllmCheckpointWeightUpdate):
-                return update
-            raise TypeError(
-                "checkpoint transfer requires VllmCheckpointWeightUpdate"
-            )
-
-        if not isinstance(update, Iterable):
-            raise TypeError(
-                f"{self._weight_transfer} transfer requires an iterable "
-                "of named weights"
-            )
-        named_weights = tuple(update)
-        if not named_weights:
-            raise ValueError("named_weights must not be empty")
-        return named_weights
-
-    def _validate_weight_device(
-        self,
-        named_weights: tuple[tuple[str, Any], ...],
-    ) -> None:
-        device = named_weights[0][1].device
-        if device.type != "cuda":
-            raise ValueError("in-memory weights must be CUDA tensors")
-        if any(weight.device != device for _, weight in named_weights):
-            raise ValueError("all weights must be on the same CUDA device")
-        if (
-            self._weight_transfer == "nccl"
-            and self._nccl_device is not None
-            and device != self._nccl_device
-        ):
-            raise ValueError("NCCL trainer device cannot change after initialization")
-
-    async def _apply_weight_update(
-        self,
-        update: VllmCheckpointWeightUpdate | tuple[tuple[str, Any], ...],
-    ) -> None:
-        if self._weight_transfer == "ipc":
-            assert isinstance(update, tuple)
-            await self._engine.update_weights(update)
-            return
-
-        await self._engine.pause_generation(mode="wait", clear_cache=True)
-        if isinstance(update, VllmCheckpointWeightUpdate):
-            await self._reload_checkpoint(update)
-        else:
-            await self._broadcast_nccl_weights(update)
-        await self._engine.resume_generation()
-
-    async def _reload_checkpoint(self, update: VllmCheckpointWeightUpdate) -> None:
-        await self._engine.collective_rpc(
-            "reload_weights",
-            kwargs={
-                "weights_path": str(update.checkpoint_path),
-                "is_checkpoint_format": True,
-            },
-        )
-
-    async def _broadcast_nccl_weights(
-        self,
-        named_weights: tuple[tuple[str, Any], ...],
-    ) -> None:
-        device = named_weights[0][1].device
-        await self._ensure_nccl_group(device)
-        await self._engine.start_weight_update()
-
-        update_request = self._weight_transfer_update_request(
-            update_info={
-                "names": [name for name, _ in named_weights],
-                "dtype_names": [
-                    str(weight.dtype).removeprefix("torch.")
-                    for _, weight in named_weights
-                ],
-                "shapes": [
-                    list(weight.shape) for _, weight in named_weights
-                ],
-                "packed": False,
-            }
-        )
-        await self._wait_for_operations(
-            self._engine.update_weights(update_request),
-            asyncio.to_thread(self._send_nccl_weights, named_weights),
-        )
-        await self._engine.finish_weight_update()
-
-    async def _ensure_nccl_group(self, device: Any) -> None:
-        if self._nccl_group is not None:
-            return
-
-        init_info = {
-            "master_address": "127.0.0.1",
-            "master_port": _find_free_local_port(),
-            "rank_offset": 1,
-            "world_size": self._inference_world_size + 1,
-        }
-        request = self._weight_transfer_init_request(init_info=init_info)
-        receiver_init = self._engine.init_weight_transfer_engine(request)
-        trainer_info = {
-            "master_address": init_info["master_address"],
-            "master_port": init_info["master_port"],
-            "world_size": init_info["world_size"],
-        }
-        results = await asyncio.gather(
-            receiver_init,
-            asyncio.to_thread(self._init_nccl_trainer, device, trainer_info),
-            return_exceptions=True,
-        )
-        group = results[1]
+    async def begin_weight_update(
+        self, update_info: Mapping[str, object]
+    ) -> asyncio.Task[Any]:
+        """Pause generation and start vLLM's asynchronous NCCL receive."""
+        if not self._channel_initialized:
+            raise RuntimeError("weight channel is not initialized")
+        await self._begin_update()
         try:
-            self._raise_operation_errors(results)
-        except BaseException:
-            if not isinstance(group, BaseException):
-                group.destroy()
+            await self._engine.pause_generation(mode="wait", clear_cache=True)
+            await self._engine.start_weight_update()
+            request = self._update_request(update_info=dict(update_info))
+            task = asyncio.create_task(self._engine.update_weights(request))
+            self._receive_task = task
+            return task
+        except BaseException as exc:
+            await self._end_update(exc)
             raise
-        self._nccl_group = group
-        self._nccl_device = device
 
-    def _init_nccl_trainer(self, device: Any, init_info: dict[str, Any]) -> Any:
-        with self._torch.cuda.device(device):
-            return self._nccl_engine.trainer_init(init_info)
+    async def finish_weight_update(self, receive_task: asyncio.Task[Any]) -> None:
+        """Commit a completed receive and resume generation."""
+        if receive_task is not self._receive_task:
+            raise RuntimeError("receive task does not match the pending update")
+        failure: BaseException | None = None
+        try:
+            await receive_task
+            await self._engine.finish_weight_update()
+            await self._engine.resume_generation()
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            self._receive_task = None
+            await self._end_update(failure)
 
-    def _send_nccl_weights(
-        self,
-        named_weights: tuple[tuple[str, Any], ...],
-    ) -> None:
-        with self._torch.cuda.device(self._nccl_device):
-            self._nccl_engine.trainer_send_weights(
-                iter(named_weights),
-                self._nccl_send_args(group=self._nccl_group, packed=False),
-            )
-
-    @staticmethod
-    async def _wait_for_operations(
-        first: Awaitable[Any], second: Awaitable[Any]
-    ) -> tuple[Any, Any]:
-        results = await asyncio.gather(first, second, return_exceptions=True)
-        VllmBackend._raise_operation_errors(results)
-        return results[0], results[1]
-
-    @staticmethod
-    def _raise_operation_errors(results: Sequence[Any]) -> None:
-        errors = [result for result in results if isinstance(result, BaseException)]
-        if len(errors) == 1:
-            raise errors[0]
-        if errors:
-            raise BaseExceptionGroup("concurrent weight transfer failed", errors)
+    async def fail_weight_update(self, message: str) -> None:
+        """Poison the backend after the trainer sender failed."""
+        failure = RuntimeError(message)
+        task = self._receive_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._receive_task = None
+        await self._end_update(failure)
 
     async def aclose(self) -> None:
-        """Wait for admitted operations and release vLLM resources once."""
-        async with self._lifecycle:
+        """Stop admitted work and release the vLLM engine."""
+        async with self._condition:
             if self._closed:
                 return
-            if self._closing:
-                await self._lifecycle.wait_for(lambda: self._closed)
-                return
-
             self._closing = True
-            self._lifecycle.notify_all()
-            await self._lifecycle.wait_for(
-                lambda: self._active_requests == 0
-                and not self._weight_update_in_progress
-            )
+            self._condition.notify_all()
+            await self._condition.wait_for(lambda: self._active_requests == 0)
 
-        group = self._nccl_group
-        try:
-            if self._weight_transfer == "ipc":
-                await asyncio.to_thread(self._engine.close)
-            else:
-                self._engine.shutdown()
-        finally:
-            self._nccl_group = None
-            self._nccl_device = None
+        task = self._receive_task
+        if task is not None and not task.done():
+            task.cancel()
+        if task is not None:
             try:
-                if group is not None:
-                    group.destroy()
-            finally:
-                async with self._lifecycle:
-                    self._closed = True
-                    self._lifecycle.notify_all()
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        try:
+            self._engine.shutdown()
+        finally:
+            async with self._condition:
+                self._closed = True
+                self._condition.notify_all()
 
     async def _begin_request(self) -> None:
-        async with self._lifecycle:
-            while self._weight_update_in_progress:
+        async with self._condition:
+            while self._updating:
                 self._raise_if_unusable()
-                await self._lifecycle.wait()
+                await self._condition.wait()
             self._raise_if_unusable()
             self._active_requests += 1
 
     async def _finish_request(self) -> None:
-        async with self._lifecycle:
+        async with self._condition:
             self._active_requests -= 1
-            self._lifecycle.notify_all()
+            self._condition.notify_all()
 
-    async def _begin_weight_update(self) -> None:
-        async with self._lifecycle:
+    async def _begin_update(self) -> None:
+        async with self._condition:
             self._raise_if_unusable()
-            self._weight_update_in_progress = True
-            self._lifecycle.notify_all()
-            try:
-                while self._active_requests > 0:
-                    if self._closing:
-                        raise RuntimeError("VllmBackend is closed")
-                    await self._lifecycle.wait()
-            except BaseException:
-                self._weight_update_in_progress = False
-                self._lifecycle.notify_all()
-                raise
+            if self._updating:
+                raise RuntimeError("a weight update is already running")
+            self._updating = True
+            await self._condition.wait_for(lambda: self._active_requests == 0)
 
-    async def _end_weight_update(self, failure: BaseException | None) -> None:
-        async with self._lifecycle:
+    async def _end_update(self, failure: BaseException | None) -> None:
+        async with self._condition:
             if failure is not None and self._poisoned is None:
                 self._poisoned = failure
-            self._weight_update_in_progress = False
-            self._lifecycle.notify_all()
+            self._updating = False
+            self._condition.notify_all()
 
     def _raise_if_unusable(self) -> None:
         if self._closing or self._closed:
-            raise RuntimeError("VllmBackend is closed")
+            raise RuntimeError("vLLM backend is closed")
         if self._poisoned is not None:
             raise VllmBackendPoisonedError(self._poisoned) from self._poisoned
 
@@ -455,9 +231,9 @@ class VllmBackend:
         if output is None or not output.finished:
             raise RuntimeError("vLLM generation ended without a final output")
         if tuple(output.prompt_token_ids) != request.prompt.token_ids:
-            raise RuntimeError("vLLM did not preserve the supplied prompt token IDs")
+            raise RuntimeError("vLLM changed the supplied prompt token IDs")
         if len(output.outputs) != 1:
-            raise RuntimeError("vLLM returned an unexpected number of completions")
+            raise RuntimeError("vLLM returned an unexpected completion count")
 
         completion = output.outputs[0]
         token_ids = tuple(int(token_id) for token_id in completion.token_ids)
@@ -480,36 +256,6 @@ class VllmBackend:
         for token_id, candidates in zip(token_ids, positions, strict=True):
             sampled = candidates.get(token_id)
             if sampled is None:
-                raise RuntimeError(
-                    "vLLM omitted a sampled token from its logprob output"
-                )
+                raise RuntimeError("vLLM omitted a sampled token logprob")
             values.append(float(sampled.logprob))
         return tuple(values)
-
-
-def _validate_checkpoint_directory(path: Path) -> None:
-    if not path.exists():
-        raise FileNotFoundError(f"checkpoint directory does not exist: {path}")
-    if not path.is_dir():
-        raise NotADirectoryError(f"checkpoint path is not a directory: {path}")
-
-
-def _validate_nccl_topology(options: Mapping[str, object]) -> None:
-    if int(options.get("nnodes", 1)) != 1:
-        raise ValueError("NCCL weight transfer currently requires one node")
-    if int(options.get("prefill_context_parallel_size", 1)) != 1:
-        raise ValueError(
-            "NCCL weight transfer does not support prefill context parallelism"
-        )
-    if options.get("distributed_executor_backend") == "external_launcher":
-        raise ValueError("NCCL weight transfer does not support external_launcher")
-    if int(os.environ.get("VLLM_DP_SIZE", "1")) != 1:
-        raise ValueError(
-            "pass data_parallel_size through engine_kwargs instead of VLLM_DP_SIZE"
-        )
-
-
-def _find_free_local_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
