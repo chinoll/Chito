@@ -49,27 +49,18 @@ class InferenceRequest:
 
 @dataclass(frozen=True, slots=True)
 class InferenceResult:
-    """Exact completion tokens and their behavior log-probabilities."""
+    """Exact completion tokens returned by the inference backend."""
 
     output_token_ids: tuple[int, ...]
-    output_logprobs: tuple[float, ...]
     policy_version: int
 
     def __post_init__(self) -> None:
         tokens = _int_tuple(self.output_token_ids, "output_token_ids")
-        logprobs = tuple(float(value) for value in self.output_logprobs)
         if not tokens:
             raise ValueError("inference output must contain at least one token")
-        if len(tokens) != len(logprobs):
-            raise ValueError(
-                "output_token_ids and output_logprobs must have equal length"
-            )
-        if any(not math.isfinite(value) for value in logprobs):
-            raise ValueError("output_logprobs must be finite")
         if self.policy_version < 0:
             raise ValueError("policy_version must be non-negative")
         object.__setattr__(self, "output_token_ids", tokens)
-        object.__setattr__(self, "output_logprobs", logprobs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,25 +70,19 @@ class RolloutSample:
     prompt_id: str
     sample_index: int
     token_ids: tuple[int, ...]
-    logprobs: tuple[float, ...]
     loss_mask: tuple[bool, ...]
     policy_version: int
     reward: float | None = None
 
     def __post_init__(self) -> None:
         tokens = _int_tuple(self.token_ids, "token_ids")
-        logprobs = tuple(float(value) for value in self.logprobs)
         loss_mask = tuple(bool(value) for value in self.loss_mask)
         if not self.prompt_id:
             raise ValueError("prompt_id must not be empty")
         if self.sample_index < 0:
             raise ValueError("sample_index must be non-negative")
-        if len(tokens) != len(logprobs) or len(tokens) != len(loss_mask):
-            raise ValueError(
-                "token_ids, logprobs, and loss_mask must have equal length"
-            )
-        if any(not math.isfinite(value) for value in logprobs):
-            raise ValueError("logprobs must be finite")
+        if len(tokens) != len(loss_mask):
+            raise ValueError("token_ids and loss_mask must have equal length")
         if not any(loss_mask):
             raise ValueError("loss_mask must select at least one generated token")
         if self.policy_version < 0:
@@ -105,7 +90,6 @@ class RolloutSample:
         if self.reward is not None and not math.isfinite(float(self.reward)):
             raise ValueError("reward must be finite")
         object.__setattr__(self, "token_ids", tokens)
-        object.__setattr__(self, "logprobs", logprobs)
         object.__setattr__(self, "loss_mask", loss_mask)
         if self.reward is not None:
             object.__setattr__(self, "reward", float(self.reward))
@@ -142,7 +126,6 @@ class TrainingSample:
     prompt_id: str
     sample_index: int
     token_ids: tuple[int, ...]
-    logprobs: tuple[float, ...]
     loss_mask: tuple[bool, ...]
     reward: float
     advantage: float
@@ -151,18 +134,13 @@ class TrainingSample:
 
     def __post_init__(self) -> None:
         tokens = _int_tuple(self.token_ids, "token_ids")
-        logprobs = tuple(float(value) for value in self.logprobs)
         loss_mask = tuple(bool(value) for value in self.loss_mask)
         if not self.prompt_id:
             raise ValueError("prompt_id must not be empty")
         if self.sample_index < 0:
             raise ValueError("sample_index must be non-negative")
-        if len(tokens) != len(logprobs) or len(tokens) != len(loss_mask):
-            raise ValueError(
-                "token_ids, logprobs, and loss_mask must have equal length"
-            )
-        if any(not math.isfinite(value) for value in logprobs):
-            raise ValueError("logprobs must be finite")
+        if len(tokens) != len(loss_mask):
+            raise ValueError("token_ids and loss_mask must have equal length")
         if not any(loss_mask):
             raise ValueError("loss_mask must select at least one generated token")
         if not math.isfinite(float(self.reward)):
@@ -172,7 +150,6 @@ class TrainingSample:
         if self.policy_version < 0:
             raise ValueError("policy_version must be non-negative")
         object.__setattr__(self, "token_ids", tokens)
-        object.__setattr__(self, "logprobs", logprobs)
         object.__setattr__(self, "loss_mask", loss_mask)
         object.__setattr__(self, "reward", float(self.reward))
         object.__setattr__(self, "advantage", float(self.advantage))

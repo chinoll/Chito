@@ -9,6 +9,7 @@ import socket
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from enum import Enum, auto
+from typing import TYPE_CHECKING
 
 from .models import (
     RolloutConfig,
@@ -19,7 +20,9 @@ from .models import (
     TrainingSample,
 )
 from .protocols import RolloutContext, RolloutWorkflow
-from .vllm_backend import VllmBackend
+
+if TYPE_CHECKING:
+    from .vllm_backend import VllmBackend
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +293,8 @@ class _RolloutService:
                 await self._backend.aclose()
 
     async def _initialize(self) -> None:
+        from .vllm_backend import VllmBackend
+
         await self._workflow.setup()
         options = dict(self._config.backend_kwargs)
         if self._config.rollout_gpu_ids:
@@ -373,7 +378,6 @@ class _RolloutService:
                 prompt_id=sample.prompt_id,
                 sample_index=sample.sample_index,
                 token_ids=sample.token_ids,
-                logprobs=sample.logprobs,
                 loss_mask=sample.loss_mask,
                 reward=float(sample.reward),
                 advantage=float(advantage),

@@ -71,9 +71,9 @@ A workflow produces one unrewarded sample. The engine invokes the asynchronous
 reward function, forms the fixed-size group, and then invokes the optional group
 post-hook. `SingleTurnWorkflow` implements the common one-generation workflow.
 
-Final `RolloutSample` values preserve the exact full token sequence, behavior
-log-probabilities, loss mask, reward, and policy version. Prompt and non-policy
-context tokens may use `loss_mask=False`.
+Final `RolloutSample` values preserve the exact full token sequence, loss mask,
+reward, and policy version. Prompt and non-policy context tokens may use
+`loss_mask=False`.
 
 ## vLLM backend
 
@@ -100,9 +100,9 @@ The adapter targets vLLM 0.25's asynchronous engine and public weight-transfer
 API. The optional dependency is bounded below by 0.25 and below the next
 unverified 0.26 release.
 
-Constructing `VllmBackend` loads the model. Generation passes the exact prompt
-token IDs to vLLM and requests the sampled-token logprob at every generated
-position. The default NCCL mode uses vLLM's asynchronous engine:
+Constructing `VllmBackend` loads the model. Generation passes exact prompt token
+IDs to vLLM and returns exact completion token IDs. The default NCCL mode uses
+vLLM's asynchronous engine:
 
 ```python
 from chito import VllmBackend
@@ -278,9 +278,9 @@ python -m pytest
 ```
 
 The real vLLM integration test is opt-in and is skipped by the command above. It
-loads `Qwen/Qwen2.5-0.5B-Instruct`, verifies exact rollout token IDs and
-logprobs, reloads a zeroed trainer checkpoint from disk, and verifies the next
-policy version uses the updated weights:
+loads `Qwen/Qwen2.5-0.5B-Instruct`, verifies exact rollout token IDs, reloads a
+zeroed trainer checkpoint from disk, and verifies the next policy version uses
+the updated weights:
 
 ```bash
 CHITO_RUN_VLLM_INTEGRATION=1 \

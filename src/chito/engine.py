@@ -146,11 +146,78 @@ class RolloutEngine:
 
 
 class _NcclWeightSender:
-    """The trainer half of vLLM's persistent NCCL weight channel."""
+    """Synchronous proxy for the isolated trainer-side NCCL process."""
 
     def __init__(self, rendezvous: _NcclRendezvous) -> None:
+        import torch
+        import torch.multiprocessing as multiprocessing
+
+        context = multiprocessing.get_context("spawn")
+        connection, child_connection = context.Pipe()
+        process = context.Process(
+            target=_nccl_sender_main,
+            args=(child_connection, rendezvous, torch.cuda.current_device()),
+            name="chito-nccl-weight-sender",
+            daemon=True,
+        )
+        self._connection = connection
+        self._process = process
+        self._usable = True
+        self._closed = False
+
+        process.start()
+        child_connection.close()
         try:
-            import torch
+            self._receive()
+        except BaseException:
+            connection.close()
+            process.join()
+            process.close()
+            raise
+
+    def send(self, named_weights: tuple[tuple[str, Any], ...]) -> None:
+        if self._closed or not self._usable:
+            raise RuntimeError("NCCL weight sender is closed")
+        self._connection.send(("send", named_weights))
+        self._receive()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._usable:
+                self._connection.send(("close", None))
+                self._receive()
+        finally:
+            self._connection.close()
+            self._process.join()
+            self._process.close()
+
+    def _receive(self) -> None:
+        try:
+            error = self._connection.recv()
+        except (EOFError, OSError) as exc:
+            self._usable = False
+            raise RuntimeError("NCCL weight sender process exited") from exc
+        if error is not None:
+            self._usable = False
+            raise RuntimeError(f"NCCL weight sender failed: {error}")
+
+
+def _nccl_sender_main(
+    connection: Any,
+    rendezvous: _NcclRendezvous,
+    device_index: int,
+) -> None:
+    """Import vLLM and own its trainer-side NCCL objects in a child process."""
+    group = None
+    try:
+        import torch
+
+        device = torch.device("cuda", device_index)
+        torch.cuda.set_device(device)
+        try:
             from vllm.distributed.weight_transfer.nccl_engine import (
                 NCCLTrainerSendWeightsArgs,
                 NCCLWeightTransferEngine,
@@ -159,37 +226,49 @@ class _NcclWeightSender:
             if exc.name != "vllm":
                 raise
             raise ModuleNotFoundError(
-                "NCCL weight updates require chito[vllm] on training rank 0"
+                "NCCL weight updates require chito[vllm]"
             ) from exc
 
-        self._torch = torch
-        self._send_args_type = NCCLTrainerSendWeightsArgs
-        self._transfer_engine = NCCLWeightTransferEngine
-        self._device = torch.device("cuda", torch.cuda.current_device())
         init_info = {
             "master_address": rendezvous.master_address,
             "master_port": rendezvous.master_port,
             "world_size": rendezvous.world_size,
         }
-        with torch.cuda.device(self._device):
-            self._group = NCCLWeightTransferEngine.trainer_init(init_info)
+        with torch.cuda.device(device):
+            group = NCCLWeightTransferEngine.trainer_init(init_info)
+        connection.send(None)
 
-    def send(self, named_weights: tuple[tuple[str, Any], ...]) -> None:
-        if named_weights[0][1].device != self._device:
-            raise ValueError(
-                "rank 0 model parameters must be on the NCCL sender device"
-            )
-        with self._torch.cuda.device(self._device):
-            self._transfer_engine.trainer_send_weights(
-                iter(named_weights),
-                self._send_args_type(group=self._group, packed=False),
-            )
+        while True:
+            command, payload = connection.recv()
+            if command == "close":
+                group.destroy()
+                group = None
+                connection.send(None)
+                return
 
-    def close(self) -> None:
-        group = self._group
-        self._group = None
+            named_weights = payload
+            if named_weights[0][1].device != device:
+                raise ValueError(
+                    "rank 0 model parameters must be on the NCCL sender device"
+                )
+            with torch.cuda.device(device):
+                NCCLWeightTransferEngine.trainer_send_weights(
+                    iter(named_weights),
+                    NCCLTrainerSendWeightsArgs(group=group, packed=False),
+                )
+            connection.send(None)
+    except BaseException as exc:
+        try:
+            connection.send(f"{type(exc).__name__}: {exc}")
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
         if group is not None:
-            group.destroy()
+            try:
+                group.destroy()
+            except Exception:
+                pass
+        connection.close()
 
 
 def _named_cuda_parameters(model: Any) -> tuple[tuple[str, Any], ...]:
@@ -208,7 +287,7 @@ def _named_cuda_parameters(model: Any) -> tuple[tuple[str, Any], ...]:
         raise ValueError("model parameters must be CUDA tensors")
     if any(weight.device != first_device for _, weight in weights):
         raise ValueError("all model parameters must be on one CUDA device")
-    return weights
+    return tuple((name, weight.detach()) for name, weight in weights)
 
 
 def _make_manifest(

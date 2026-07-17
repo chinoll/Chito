@@ -6,7 +6,7 @@ import asyncio
 import itertools
 import os
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Any
 
 from .models import InferenceRequest, InferenceResult
@@ -35,7 +35,6 @@ class VllmBackend:
         engine_kwargs: Mapping[str, object],
     ) -> None:
         options = dict(engine_kwargs)
-        options["logprobs_mode"] = "processed_logprobs"
         options["weight_transfer_config"] = {"backend": "nccl"}
 
         try:
@@ -69,7 +68,6 @@ class VllmBackend:
             max_tokens=max_tokens,
             temperature=float(temperature),
             top_p=float(top_p),
-            logprobs=0,
             detokenize=False,
         )
         self._tokens_prompt = TokensPrompt
@@ -97,7 +95,7 @@ class VllmBackend:
         return self._inference_world_size
 
     async def generate(self, request: InferenceRequest) -> InferenceResult:
-        """Generate from exact token IDs and keep sampled-token logprobs."""
+        """Generate exact completion token IDs."""
         if not isinstance(request, InferenceRequest):
             raise TypeError("request must be an InferenceRequest")
 
@@ -237,25 +235,7 @@ class VllmBackend:
 
         completion = output.outputs[0]
         token_ids = tuple(int(token_id) for token_id in completion.token_ids)
-        logprobs = VllmBackend._sampled_logprobs(token_ids, completion.logprobs)
         return InferenceResult(
             output_token_ids=token_ids,
-            output_logprobs=logprobs,
             policy_version=request.policy_version,
         )
-
-    @staticmethod
-    def _sampled_logprobs(
-        token_ids: tuple[int, ...],
-        positions: Sequence[Mapping[int, Any]] | None,
-    ) -> tuple[float, ...]:
-        if positions is None or len(positions) != len(token_ids):
-            raise RuntimeError("vLLM returned incomplete sampled-token logprobs")
-
-        values: list[float] = []
-        for token_id, candidates in zip(token_ids, positions, strict=True):
-            sampled = candidates.get(token_id)
-            if sampled is None:
-                raise RuntimeError("vLLM omitted a sampled token logprob")
-            values.append(float(sampled.logprob))
-        return tuple(values)
