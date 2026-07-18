@@ -53,6 +53,8 @@ class InferenceResult:
 
     output_token_ids: tuple[int, ...]
     policy_version: int
+    finish_reason: str
+    stop_reason: int | str | None = None
 
     def __post_init__(self) -> None:
         tokens = _int_tuple(self.output_token_ids, "output_token_ids")
@@ -60,6 +62,12 @@ class InferenceResult:
             raise ValueError("inference output must contain at least one token")
         if self.policy_version < 0:
             raise ValueError("policy_version must be non-negative")
+        if not isinstance(self.finish_reason, str) or not self.finish_reason:
+            raise ValueError("finish_reason must be a non-empty string")
+        if isinstance(self.stop_reason, bool) or not isinstance(
+            self.stop_reason, (int, str, type(None))
+        ):
+            raise TypeError("stop_reason must be an integer, string, or None")
         object.__setattr__(self, "output_token_ids", tokens)
 
 
@@ -72,6 +80,8 @@ class RolloutSample:
     token_ids: tuple[int, ...]
     loss_mask: tuple[bool, ...]
     policy_version: int
+    finish_reason: str
+    stop_reason: int | str | None = None
     reward: float | None = None
 
     def __post_init__(self) -> None:
@@ -87,6 +97,12 @@ class RolloutSample:
             raise ValueError("loss_mask must select at least one generated token")
         if self.policy_version < 0:
             raise ValueError("policy_version must be non-negative")
+        if not isinstance(self.finish_reason, str) or not self.finish_reason:
+            raise ValueError("finish_reason must be a non-empty string")
+        if isinstance(self.stop_reason, bool) or not isinstance(
+            self.stop_reason, (int, str, type(None))
+        ):
+            raise TypeError("stop_reason must be an integer, string, or None")
         if self.reward is not None and not math.isfinite(float(self.reward)):
             raise ValueError("reward must be finite")
         object.__setattr__(self, "token_ids", tokens)

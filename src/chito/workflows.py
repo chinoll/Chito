@@ -38,6 +38,8 @@ class GRPOWorkflow:
             token_ids=prompt.token_ids + result.output_token_ids,
             loss_mask=(False,) * prompt_length + (True,) * output_length,
             policy_version=context.policy_version,
+            finish_reason=result.finish_reason,
+            stop_reason=result.stop_reason,
         )
 
     async def reward(self, prompt: RolloutPrompt, sample: RolloutSample) -> float:

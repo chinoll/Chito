@@ -72,8 +72,8 @@ reward function, forms the fixed-size group, and then invokes the optional group
 post-hook. `SingleTurnWorkflow` implements the common one-generation workflow.
 
 Final `RolloutSample` values preserve the exact full token sequence, loss mask,
-reward, and policy version. Prompt and non-policy context tokens may use
-`loss_mask=False`.
+reward, policy version, and the backend's `finish_reason` and `stop_reason`.
+Prompt and non-policy context tokens may use `loss_mask=False`.
 
 ## vLLM backend
 

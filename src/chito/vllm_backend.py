@@ -238,4 +238,6 @@ class VllmBackend:
         return InferenceResult(
             output_token_ids=token_ids,
             policy_version=request.policy_version,
+            finish_reason=completion.finish_reason,
+            stop_reason=completion.stop_reason,
         )
