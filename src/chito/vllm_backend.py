@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import itertools
 import os
 import uuid
@@ -33,6 +35,7 @@ class VllmBackend:
         temperature: float,
         top_p: float,
         engine_kwargs: Mapping[str, object],
+        seed: int = 0,
     ) -> None:
         options = dict(engine_kwargs)
         options["weight_transfer_config"] = {"backend": "nccl"}
@@ -70,6 +73,7 @@ class VllmBackend:
             top_p=float(top_p),
             detokenize=False,
         )
+        self._seed = seed
         self._tokens_prompt = TokensPrompt
         self._init_request = WeightTransferInitRequest
         self._update_request = WeightTransferUpdateRequest
@@ -105,14 +109,23 @@ class VllmBackend:
                 prompt_token_ids=list(request.prompt.token_ids)
             )
             request_id = f"{self._request_prefix}-{next(self._request_ids)}"
+            sampling_params = copy.copy(self._sampling_params)
+            sampling_params.seed = self._request_seed(request)
             final_output = None
             async for output in self._engine.generate(
-                prompt, self._sampling_params, request_id
+                prompt, sampling_params, request_id
             ):
                 final_output = output
             return self._to_result(final_output, request)
         finally:
             await self._finish_request()
+
+    def _request_seed(self, request: InferenceRequest) -> int:
+        key = (
+            f"{self._seed}:{request.policy_version}:"
+            f"{request.prompt.prompt_id}:{request.sample_index}"
+        ).encode()
+        return int.from_bytes(hashlib.blake2s(key, digest_size=4).digest(), "little")
 
     async def init_weight_channel(self, init_info: Mapping[str, object]) -> None:
         """Join the persistent NCCL communicator as the vLLM receivers."""

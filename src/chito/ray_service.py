@@ -307,6 +307,7 @@ class _RolloutService:
             temperature=self._config.temperature,
             top_p=self._config.top_p,
             engine_kwargs=options,
+            seed=self._config.seed,
         )
         if self._config.rollout_gpu_ids and (
             self._backend.inference_world_size != len(self._config.rollout_gpu_ids)
