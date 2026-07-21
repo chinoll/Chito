@@ -1,293 +1,188 @@
 # chito
 
-`chito` is a small, backend-agnostic asynchronous rollout coordinator for GRPO.
-It overlaps complete-group rollout production with training-batch consumption and
-switches inference weights only at group boundaries.
+`chito` is a small GRPO rollout service for distributed training. Training code
+constructs one `RolloutEngine`; rank 0 then starts a Ray actor that owns the
+dataset, Workflow, and vLLM. The training processes only request batches and
+push updated inference weights.
 
-V1 requires Python 3.11 or newer. Its optional `VllmBackend` implements the
-`InferenceBackend` boundary with vLLM. Other inference systems can implement the
-same small protocol without changing the rollout engine.
+V1 supports:
 
-## Core semantics
+- Python 3.11 or newer;
+- vLLM 0.25 and Ray on one server;
+- synchronous rollout or one-batch asynchronous lookahead;
+- NCCL weight transfer from training rank 0 to vLLM;
+- ZeRO-2/DDP-style training where rank 0 has the complete synchronized model.
 
-- `group_size` is fixed, must be at least two, and belongs to the engine rather
-  than the workflow.
-- `train_batch_size` counts complete prompt groups, not individual samples.
-- Groups run concurrently up to `max_concurrent_groups`. Samples within a group
-  also run concurrently.
-- Every complete group uses one immutable `policy_version`.
-- The accepted-group buffer is bounded at
-  `train_batch_size * prefetch_batches`.
-- A group post-hook can replace a complete group or return `None` to reject it.
-  Replacement groups are checked for prompt identity, sample count, sample
-  indices, rewards, and policy-version consistency.
-- `update_weights()` closes new admission, waits for all active groups to finish,
-  updates the backend, increments the version, and then reopens admission.
+SGLang, per-rank streaming, ZeRO-3/FSDP sharded weight transfer, and partial
+agent rollout resume are not implemented in V1.
 
-`rollout(source)` registers exactly one asynchronous prompt source, starts an
-owned background producer, and returns immediately. Producer failures are raised
-from `next_batch()` as `RolloutFailedError`.
+## Installation
 
-## Backend and workflow contracts
-
-```python
-from chito import (
-    InferenceBackend,
-    InferenceRequest,
-    InferenceResult,
-    RolloutContext,
-    RolloutPrompt,
-    RolloutSample,
-    RolloutWorkflow,
-)
-
-
-class MyBackend(InferenceBackend):
-    async def generate(self, request: InferenceRequest) -> InferenceResult:
-        ...
-
-    async def update_weights(
-        self,
-        update: object,
-        *,
-        new_policy_version: int,
-    ) -> None:
-        ...
-
-    async def aclose(self) -> None:
-        ...
-
-
-class MyWorkflow(RolloutWorkflow):
-    async def run(
-        self,
-        context: RolloutContext,
-        prompt: RolloutPrompt,
-    ) -> RolloutSample:
-        ...
-```
-
-A workflow produces one unrewarded sample. The engine invokes the asynchronous
-reward function, forms the fixed-size group, and then invokes the optional group
-post-hook. `SingleTurnWorkflow` implements the common one-generation workflow.
-
-Final `RolloutSample` values preserve the exact full token sequence, loss mask,
-reward, policy version, and the backend's `finish_reason` and `stop_reason`.
-Prompt and non-policy context tokens may use `loss_mask=False`.
-
-## vLLM backend
-
-Install the optional dependency, or install `chito` into an environment that
-already contains a compatible vLLM build:
+Install the vLLM runtime and training dependencies:
 
 ```bash
-python -m pip install -e '.[vllm]'
+python -m pip install -e '.[vllm,train]'
 ```
 
-CUDA wheels must match the installed NVIDIA driver. For example, a separate
-CUDA 12.9 environment can be created with `uv` without embedding any
-machine-specific path in the project:
+The declared vLLM range is `>=0.25,<0.26`. PyTorch, CUDA, and vLLM must use
+compatible builds for the local NVIDIA driver.
 
-```bash
-VENV_PATH="${VENV_PATH:-.venv-vllm}"
-uv venv --python 3.12 "$VENV_PATH"
-uv pip install --python "$VENV_PATH/bin/python" \
-  vllm==0.25.0 --torch-backend=auto
-uv pip install --python "$VENV_PATH/bin/python" -e '.[test,vllm]'
-```
+## Public API
 
-The adapter targets vLLM 0.25's asynchronous engine and public weight-transfer
-API. The optional dependency is bounded below by 0.25 and below the next
-unverified 0.26 release.
-
-Constructing `VllmBackend` loads the model. Generation passes exact prompt token
-IDs to vLLM and returns exact completion token IDs. The default NCCL mode uses
-vLLM's asynchronous engine:
+The Engine has three constructor arguments and three public async methods:
 
 ```python
-from chito import VllmBackend
+from chito import RolloutEngine
 
-backend = VllmBackend(
-    "Qwen/Qwen2.5-0.5B-Instruct",
-    max_tokens=64,
-    temperature=0.8,
-    engine_kwargs={
-        "dtype": "float16",
-        "device_ids": [1],  # inference uses physical GPU 1
+
+engine = RolloutEngine(dataset=dataset, workflow=workflow, config=config)
+
+batch = await engine.next_batch()
+new_policy_version = await engine.update_weights(model)  # rank 0 only
+await engine.aclose()
+```
+
+`RolloutConfig` is flat. Only four fields are required:
+
+```python
+from chito import RolloutConfig
+
+config = RolloutConfig(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    group_size=8,
+    per_device_train_batch_size=32,
+    max_concurrent_groups=64,
+    rollout_mode="async",       # "sync" or "async"
+    rollout_gpu_ids=(0,),        # physical GPU IDs used by vLLM
+    max_tokens=1024,
+    temperature=1.0,
+    backend_kwargs={
+        "dtype": "bfloat16",
         "gpu_memory_utilization": 0.8,
-        "max_model_len": 2048,
+        "max_model_len": 4096,
     },
 )
 ```
 
-`engine_kwargs` are forwarded to vLLM's public `AsyncEngineArgs`. The adapter
-owns the loaded engine; call `aclose()` directly, or let `RolloutEngine.aclose()`
-close it. In this two-GPU NCCL example, the trainer uses `cuda:0`, while vLLM
-0.25's `device_ids` selects GPU 1 for its default non-Ray executor.
+The global number of samples in one training step is
+`per_device_train_batch_size * train_world_size`. It must be divisible by
+`group_size`.
 
-NCCL is the default weight-transfer mode. The trainer occupies rank 0 and must
-use a different GPU from the inference workers. Submit the trainer's checkpoint-
-format named parameters after each optimizer step:
+## Rollout semantics
 
-```python
-new_policy_version = await engine.update_weights(
-    trainer.named_parameters()
-)
+Each dataset item becomes one complete GRPO group:
+
+```text
+dataset item
+  -> Workflow.prepare
+  -> group_size concurrent Workflow.run calls
+  -> Workflow.reward for every sample
+  -> Workflow.postprocess
+  -> Workflow.compute_advantages on the complete group
+  -> independent TrainingSample values
+  -> fixed contiguous shard for each training rank
 ```
 
-On the first update, the backend creates one local NCCL group containing the
-trainer and all data-, pipeline-, and tensor-parallel inference workers. Later
-updates reuse that group. Each update pauses generation, runs vLLM's public
-`start_weight_update` / `update_weights` / `finish_weight_update` protocol, and
-resumes only after every worker has loaded the new weights. V1 assumes the
-trainer and inference workers are on the same machine.
+Advantages are therefore computed before a group may cross a rank boundary. A
+Workflow may return `None` from `postprocess` to reject a whole group; the
+service keeps reading dataset items until the batch is full.
 
-For a single-GPU setup, expose exactly one GPU before starting Python and select
-IPC mode:
+Both rollout modes return the same `TrainingBatch` shape:
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python train.py
-```
+- `sync` generates the next batch only after the preceding weight update has
+  completed.
+- `async` trains batch N while vLLM prepares batch N+1 with the current
+  inference weights. `update_weights()` waits for that one prefetched batch,
+  updates vLLM synchronously, and then releases it. After warmup, its behavior
+  policy is one version behind the learner.
 
-```python
-from chito import VllmBackend
+V1 never queues a third batch and does not release one rank early. Every rank's
+`next_batch()` waits for the complete global batch and then receives its fixed
+local shard.
 
-backend = VllmBackend(model, weight_transfer="ipc")
+## Workflow
 
-# The trainer stays in the driver process.
-optimizer.step()
-new_policy_version = await engine.update_weights(
-    trainer.named_parameters()
-)
-```
-
-The backend privately owns the local Ray runtime, placement group, and
-synchronous vLLM `LLM` actor. `generate()` remains awaitable, but V1 serializes
-separate calls through that actor and does not provide continuous batching
-across calls. The backend chooses the packed IPC buffer size as the larger of
-vLLM's default and the largest submitted tensor.
-
-Checkpoint reload remains available when IPC is unsuitable. Save each policy
-to a new immutable directory:
+For ordinary single-turn GRPO, subclass `GRPOWorkflow` and implement only prompt
+preparation and reward calculation:
 
 ```python
-from chito import VllmBackend, VllmCheckpointWeightUpdate
+from chito import GRPOWorkflow, RolloutPrompt
 
-backend = VllmBackend(model, weight_transfer="checkpoint")
-update = VllmCheckpointWeightUpdate("/checkpoints/policy-0001")
-new_policy_version = await engine.update_weights(update)
+
+class MathWorkflow(GRPOWorkflow):
+    async def setup(self) -> None:
+        # Load the tokenizer inside the rollout actor.
+        ...
+
+    async def prepare(self, item: object, item_id: str) -> RolloutPrompt:
+        token_ids = ...
+        return RolloutPrompt(item_id, tuple(token_ids), {"answer": item["answer"]})
+
+    async def reward(self, prompt, sample) -> float:
+        return ...
 ```
 
-Checkpoint mode invokes vLLM's public `reload_weights` collective RPC. The path
-is resolved to an absolute directory and must be visible to every vLLM worker.
+`run`, `postprocess`, and `compute_advantages` may also be overridden. A custom
+`run` can perform multiple model/tool/environment turns, but V1 waits for the
+entire run before changing inference weights; it does not pause and resume a
+live trajectory across policy versions.
 
-An invalid or deleted checkpoint directory is rejected before vLLM is paused and
-can be corrected and retried. Once a physical pause, transfer, load, or resume
-phase fails, the model may contain partial weights; the backend becomes poisoned
-and rejects generation and further updates. Close it and load a fresh backend
-rather than assigning a policy version to uncertain weights.
+## Distributed training
 
-## Usage
+Constructing `RolloutEngine` is collective across the initialized training
+process group. Rank 0 supplies the dataset and Workflow; the other ranks pass
+`None` and connect to the same rollout actor:
 
 ```python
-from collections.abc import AsyncIterator
+dataset = load_training_data() if accelerator.is_main_process else None
+workflow = MathWorkflow() if accelerator.is_main_process else None
+engine = RolloutEngine(dataset, workflow, config)
 
-from chito import (
-    RolloutConfig,
-    RolloutEngine,
-    RolloutPrompt,
-    SingleTurnWorkflow,
-    SourceExhaustedError,
-)
-
-
-async def prompt_source() -> AsyncIterator[RolloutPrompt]:
-    yield RolloutPrompt(
-        prompt_id="task-1",
-        token_ids=(101, 102),
-        metadata={"answer": 42},
-    )
-
-
-async def reward(prompt, sample) -> float:
-    return score(sample, expected=prompt.metadata["answer"])
-
-
-engine = RolloutEngine(
-    backend=backend,
-    workflow=SingleTurnWorkflow(),
-    reward_function=reward,
-    config=RolloutConfig(
-        group_size=8,
-        train_batch_size=32,
-        max_concurrent_groups=64,
-        prefetch_batches=1,
-    ),
-    post_hook=optional_group_filter,
-)
-
-await engine.rollout(prompt_source())
 try:
-    while True:
-        batch = await engine.next_batch()
-        update = await trainer.train(batch)
-        new_version = await engine.update_weights(update)
-except SourceExhaustedError as exhausted:
-    # next_batch never returns a partial batch. Any final accepted groups are
-    # exposed on the exception instead of being silently discarded.
-    final_groups = exhausted.remaining_groups
+    for step in range(num_steps):
+        batch = await engine.next_batch()  # called by every rank
+
+        loss = compute_loss(model, batch)
+        accelerator.backward(loss)
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if step + 1 < num_steps:
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                await engine.update_weights(accelerator.unwrap_model(model))
 finally:
-    await engine.aclose()
+    await engine.aclose()  # called by every rank
 ```
 
-If the source or any rollout task fails, `next_batch()` fails immediately rather
-than waiting forever. Closing the engine cancels internal work, wakes blocked
-producers and consumers, and closes the backend exactly once.
+DeepSpeed, DDP, Accelerate, or `torchrun` remains responsible for synchronizing
+the training ranks. `update_weights()` does not run a training barrier or copy
+parameters between training ranks; it only sends rank 0's already synchronized
+complete CUDA parameters to vLLM. V1 therefore targets ZeRO-2 rather than
+sharded-parameter ZeRO-3/FSDP.
 
-## Samples
+## GSM8K example
 
-[`samples/train_grpo.py`](samples/train_grpo.py) is a minimal educational
-single-GPU BF16 clipped-GRPO loop. The trainer stays in the driver process, and
-each optimizer step updates vLLM through packed CUDA IPC handles. The script
-does not import Ray or manage actors, placement groups, or IPC buffers; all Ray
-details stay inside `VllmBackend`:
+[`samples/async_gsm8k_grpo.py`](samples/async_gsm8k_grpo.py) contains a complete,
+flat Accelerate + DeepSpeed training loop with format and answer rewards. For
+example, reserve physical GPU 0 for vLLM and train on GPUs 1 through 4:
 
 ```bash
-python -m pip install -e '.[vllm]'
-python samples/train_grpo.py
+CHITO_MODEL=/models/Qwen2.5-0.5B-Instruct \
+CHITO_ROLLOUT_MODE=async \
+CHITO_ROLLOUT_GPU_IDS=0 \
+CUDA_VISIBLE_DEVICES=1,2,3,4 \
+accelerate launch --use_deepspeed --num_processes 4 \
+  samples/async_gsm8k_grpo.py
 ```
 
-`CUDA_VISIBLE_DEVICES` must expose exactly one physical GPU. Set `CHITO_MODEL`
-when the model is already available in a local directory:
+Set `CHITO_GSM8K_TRAIN` to a local GSM8K JSONL file when training offline. Set
+`CHITO_ROLLOUT_MODE=sync` to run the matched synchronous schedule without
+changing the training loss.
 
-```bash
-CUDA_VISIBLE_DEVICES=0 CHITO_MODEL=/models/Qwen2.5-0.5B-Instruct \
-  python samples/train_grpo.py
-```
+## Future work
 
-The backend automatically sizes its packed IPC buffer from vLLM's default and
-the model's largest tensor.
-
-## Tests
-
-The test suite uses a deterministic fake backend and standard `asyncio.run`, so no
-async pytest plugin is required:
-
-```bash
-python -m pytest
-```
-
-The real vLLM integration test is opt-in and is skipped by the command above. It
-loads `Qwen/Qwen2.5-0.5B-Instruct`, verifies exact rollout token IDs, reloads a
-zeroed trainer checkpoint from disk, and verifies the next policy version uses
-the updated weights:
-
-```bash
-CHITO_RUN_VLLM_INTEGRATION=1 \
-  python -m pytest tests/integration/test_vllm_smoke.py -s
-```
-
-The test requires a working CUDA/vLLM environment and either network access or
-a populated model cache. `CHITO_VLLM_MODEL` can select another local path or
-model ID. Memory-related defaults can be overridden with
-`CHITO_VLLM_GPU_MEMORY_UTILIZATION` and `CHITO_VLLM_MAX_MODEL_LEN`.
+The exact V1 double-buffer protocol and the proposed V2/V3 boundaries are in
+[`async_plan.md`](async_plan.md). The comparison with verl and slime is in
+[`research.md`](research.md). Those plans do not imply that streaming rollout,
+partial resume, SGLang, or multi-node recovery already exists.

@@ -37,7 +37,8 @@ class GRPOWorkflow:
             sample_index=context.sample_index,
             token_ids=prompt.token_ids + result.output_token_ids,
             loss_mask=(False,) * prompt_length + (True,) * output_length,
-            policy_version=context.policy_version,
+            behavior_logprobs=(0.0,) * prompt_length + result.output_logprobs,
+            policy_version=result.policy_version,
             finish_reason=result.finish_reason,
             stop_reason=result.stop_reason,
         )

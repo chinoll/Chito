@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from .models import RolloutConfig, TrainingBatch
@@ -16,6 +17,13 @@ from .ray_service import (
     _RolloutService,
     _WeightManifest,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _ServiceStartupOutcome:
+    address: _RayServiceAddress | None
+    error_type: str | None = None
+    error_message: str | None = None
 
 
 class RolloutEngine:
@@ -35,47 +43,130 @@ class RolloutEngine:
         self._config = config
         self._next_step_id = 0
         self._last_batch_id: int | None = None
+        self._last_updated_batch_id: int | None = None
+        self._next_batch_lock = asyncio.Lock()
+        self._update_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
         self._closed = False
 
-        self._ray = _import_ray()
+        self._ray: Any = None
         self._sender: _NcclWeightSender | None = None
-        address: _RayServiceAddress | None = None
+        outcome: _ServiceStartupOutcome | None = None
+        startup_cause: BaseException | None = None
 
         if self._rank == 0:
-            if dataset is None or workflow is None:
-                raise ValueError("rank 0 must provide dataset and workflow")
-            address = self._start_service(dataset, workflow)
+            try:
+                if dataset is None or workflow is None:
+                    raise ValueError("rank 0 must provide dataset and workflow")
+                self._ray = _import_ray()
+                address = self._start_service(dataset, workflow)
+                outcome = _ServiceStartupOutcome(address)
+            except BaseException as exc:
+                startup_cause = exc
+                outcome = _ServiceStartupOutcome(
+                    address=None,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
 
-        address = _broadcast_service_address(address, self._rank, self._world_size)
+        try:
+            outcome = _broadcast_startup_outcome(outcome, self._rank, self._world_size)
+        except BaseException as exc:
+            if self._rank == 0 and startup_cause is None:
+                self._cleanup_started_service(exc)
+            raise
+
+        if outcome.error_type is not None:
+            error = RuntimeError(
+                "rollout service startup failed: "
+                f"{outcome.error_type}: {outcome.error_message}"
+            )
+            if startup_cause is not None:
+                raise error from startup_cause
+            raise error
+
+        address = outcome.address
+        if address is None:
+            raise RuntimeError("rollout service startup returned no address")
         if self._rank != 0:
+            self._ray = _import_ray()
             self._ray.init(address=address.address, namespace=address.namespace)
             self._service = self._ray.get_actor(address.actor_name)
 
     async def next_batch(self) -> TrainingBatch:
         """Wait for the global buffer, then return this rank's contiguous shard."""
-        self._raise_if_closed()
-        request = _BatchRequest(
-            rank=self._rank,
-            world_size=self._world_size,
-            step_id=self._next_step_id,
-        )
-        batch = await self._get(self._service.next_batch.remote(request))
-        if not isinstance(batch, TrainingBatch):
-            raise TypeError("rollout service returned an invalid TrainingBatch")
-        self._next_step_id += 1
-        self._last_batch_id = batch.batch_id
-        return batch
+        async with self._next_batch_lock:
+            self._raise_if_closed()
+            if (
+                self._rank == 0
+                and self._last_batch_id is not None
+                and self._last_updated_batch_id != self._last_batch_id
+            ):
+                raise RuntimeError("update_weights must follow each training batch")
+
+            request = _BatchRequest(
+                rank=self._rank,
+                world_size=self._world_size,
+                step_id=self._next_step_id,
+            )
+            batch = await self._get(self._service.next_batch.remote(request))
+            if not isinstance(batch, TrainingBatch):
+                raise TypeError("rollout service returned an invalid TrainingBatch")
+            if batch.batch_id != self._next_step_id:
+                raise RuntimeError("rollout service returned a batch out of order")
+            self._next_step_id += 1
+            self._last_batch_id = batch.batch_id
+            return batch
 
     async def update_weights(self, model: Any) -> int:
         """Push rank 0's already-synchronized full parameters directly by NCCL."""
         self._raise_if_closed()
         if self._rank != 0:
             raise RuntimeError("only training rank 0 may update rollout weights")
-        if self._last_batch_id is None:
+
+        async with self._update_lock:
+            self._raise_if_closed()
+            transaction = asyncio.create_task(
+                self._update_weights_transaction(model),
+                name="chito-weight-update",
+            )
+            cancelled: asyncio.CancelledError | None = None
+            while not transaction.done():
+                try:
+                    await asyncio.shield(transaction)
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+                except BaseException:
+                    break
+
+            try:
+                result = transaction.result()
+            except BaseException:
+                if cancelled is not None:
+                    raise cancelled
+                raise
+            if cancelled is not None:
+                raise cancelled
+            return result
+
+    async def _update_weights_transaction(self, model: Any) -> int:
+        self._raise_if_closed()
+        batch_id = self._last_batch_id
+        if batch_id is None:
             raise RuntimeError("call next_batch before update_weights")
+        if batch_id == self._last_updated_batch_id:
+            raise RuntimeError("the current batch was already updated")
+        expected_batch_id = (
+            0
+            if self._last_updated_batch_id is None
+            else self._last_updated_batch_id + 1
+        )
+        if batch_id != expected_batch_id:
+            raise RuntimeError("weight updates must follow batch order exactly")
 
         named_weights = _named_cuda_parameters(model)
-        manifest = _make_manifest(self._last_batch_id, named_weights)
+        manifest = _make_manifest(batch_id, named_weights)
         ticket = await self._get(self._service.begin_weight_update.remote(manifest))
         try:
             assert self._sender is not None
@@ -83,59 +174,126 @@ class RolloutEngine:
         except BaseException as exc:
             await self._get(self._service.fail_weight_update.remote(ticket, str(exc)))
             raise
-        return int(await self._get(self._service.finish_weight_update.remote(ticket)))
+
+        version = int(
+            await self._get(self._service.finish_weight_update.remote(ticket))
+        )
+        if version != ticket.new_policy_version:
+            raise RuntimeError("rollout service committed an unexpected policy version")
+        self._last_updated_batch_id = batch_id
+        return version
 
     async def aclose(self) -> None:
         """Close this client; rank 0 also closes the owned service and runtime."""
-        if self._closed:
-            return
-        self._closed = True
-        if self._rank != 0:
-            self._ray.shutdown()
-            return
+        async with self._close_lock:
+            if self._close_task is None:
+                self._closed = True
+                self._close_task = asyncio.create_task(
+                    self._close_resources(), name="chito-rollout-close"
+                )
+            close_task = self._close_task
+        await asyncio.shield(close_task)
+
+    async def _close_resources(self) -> None:
+        async with self._update_lock:
+            if self._rank != 0:
+                self._ray.shutdown()
+                return
+
+            try:
+                await self._get(self._service.close.remote())
+            finally:
+                try:
+                    if self._sender is not None:
+                        self._sender.close()
+                finally:
+                    self._ray.shutdown()
+
+    def _cleanup_started_service(self, primary: BaseException | None) -> None:
+        failures: list[tuple[str, BaseException]] = []
+        service = getattr(self, "_service", None)
+        if service is not None:
+            try:
+                self._ray.get(service.close.remote())
+            except BaseException as exc:
+                failures.append(("rollout actor close", exc))
+                kill = getattr(self._ray, "kill", None)
+                if kill is not None:
+                    try:
+                        kill(service, no_restart=True)
+                    except BaseException as kill_exc:
+                        failures.append(("rollout actor kill", kill_exc))
+
+        if self._sender is not None:
+            try:
+                self._sender.close()
+            except BaseException as exc:
+                failures.append(("NCCL sender close", exc))
+            self._sender = None
 
         try:
-            await self._get(self._service.close.remote())
-        finally:
-            if self._sender is not None:
-                self._sender.close()
             self._ray.shutdown()
+        except BaseException as exc:
+            failures.append(("Ray shutdown", exc))
+
+        if primary is not None:
+            for phase, failure in failures:
+                primary.add_note(
+                    f"startup cleanup failed during {phase}: "
+                    f"{type(failure).__name__}: {failure}"
+                )
+            return
+        if failures:
+            phase, failure = failures[0]
+            failure.add_note(f"startup cleanup first failed during {phase}")
+            for later_phase, later_failure in failures[1:]:
+                failure.add_note(
+                    f"additional startup cleanup failure during {later_phase}: "
+                    f"{type(later_failure).__name__}: {later_failure}"
+                )
+            raise failure
 
     def _start_service(
         self,
         dataset: Sequence[object],
         workflow: RolloutWorkflow,
     ) -> _RayServiceAddress:
-        namespace = f"chito-{uuid.uuid4().hex}"
-        actor_name = f"rollout-{uuid.uuid4().hex}"
-        context = self._ray.init(namespace=namespace)
-        cluster_address = str(context.address_info["address"])
+        try:
+            namespace = f"chito-{uuid.uuid4().hex}"
+            actor_name = f"rollout-{uuid.uuid4().hex}"
+            context = self._ray.init(namespace=namespace)
+            cluster_address = str(context.address_info["address"])
 
-        remote_service = self._ray.remote(
-            num_cpus=1,
-            max_concurrency=self._world_size + 2,
-        )(_RolloutService)
-        options: dict[str, object] = {"name": actor_name}
-        if self._config.rollout_gpu_ids:
-            options["runtime_env"] = {
-                "env_vars": {
-                    "CUDA_VISIBLE_DEVICES": ",".join(
-                        str(device) for device in self._config.rollout_gpu_ids
-                    )
+            remote_service = self._ray.remote(
+                num_cpus=1,
+                max_concurrency=self._world_size + 2,
+                max_restarts=0,
+                max_task_retries=0,
+            )(_RolloutService)
+            options: dict[str, object] = {"name": actor_name}
+            if self._config.rollout_gpu_ids:
+                options["runtime_env"] = {
+                    "env_vars": {
+                        "CUDA_VISIBLE_DEVICES": ",".join(
+                            str(device) for device in self._config.rollout_gpu_ids
+                        )
+                    }
                 }
-            }
-        self._service = remote_service.options(**options).remote(
-            dataset,
-            workflow,
-            self._config,
-            self._world_size,
-        )
-        self._ray.get(self._service.ready.remote())
+            self._service = remote_service.options(**options).remote(
+                dataset,
+                workflow,
+                self._config,
+                self._world_size,
+            )
+            self._ray.get(self._service.ready.remote())
 
-        rendezvous = self._ray.get(self._service.start_weight_channel.remote())
-        self._sender = _NcclWeightSender(rendezvous)
-        self._ray.get(self._service.finish_weight_channel.remote())
-        return _RayServiceAddress(cluster_address, namespace, actor_name)
+            rendezvous = self._ray.get(self._service.start_weight_channel.remote())
+            self._sender = _NcclWeightSender(rendezvous)
+            self._ray.get(self._service.finish_weight_channel.remote())
+            return _RayServiceAddress(cluster_address, namespace, actor_name)
+        except BaseException as exc:
+            self._cleanup_started_service(exc)
+            raise
 
     async def _get(self, reference: Any) -> Any:
         return await asyncio.to_thread(self._ray.get, reference)
@@ -150,9 +308,8 @@ class _NcclWeightSender:
 
     def __init__(self, rendezvous: _NcclRendezvous) -> None:
         import torch
-        import torch.multiprocessing as multiprocessing
 
-        context = multiprocessing.get_context("spawn")
+        context = torch.multiprocessing.get_context("spawn")
         connection, child_connection = context.Pipe()
         process = context.Process(
             target=_nccl_sender_main,
@@ -312,26 +469,27 @@ def _distributed_identity() -> tuple[int, int]:
     return distributed.get_rank(), distributed.get_world_size()
 
 
-def _broadcast_service_address(
-    address: _RayServiceAddress | None,
+def _broadcast_startup_outcome(
+    outcome: _ServiceStartupOutcome | None,
     rank: int,
     world_size: int,
-) -> _RayServiceAddress:
+) -> _ServiceStartupOutcome:
     if world_size == 1:
-        assert address is not None
-        return address
+        if outcome is None:
+            raise RuntimeError("rank 0 did not provide a startup outcome")
+        return outcome
 
     import torch
     import torch.distributed as distributed
 
-    values = [address]
+    values = [outcome]
     device = None
     if distributed.get_backend() == "nccl":
         device = torch.device("cuda", torch.cuda.current_device())
     distributed.broadcast_object_list(values, src=0, device=device)
     result = values[0]
-    if not isinstance(result, _RayServiceAddress):
-        raise RuntimeError(f"rank {rank} received an invalid rollout service address")
+    if not isinstance(result, _ServiceStartupOutcome):
+        raise RuntimeError(f"rank {rank} received an invalid rollout startup outcome")
     return result
 
 

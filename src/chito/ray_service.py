@@ -84,7 +84,7 @@ class _WeightUpdateTicket:
 class _TrainingStep:
     batch_id: int
     policy_version: int
-    samples: list[TrainingSample]
+    samples: tuple[TrainingSample, ...]
     delivered_ranks: set[int]
 
 
@@ -96,9 +96,8 @@ class _PendingWeightUpdate:
 
 class _ServiceState(Enum):
     STARTING = auto()
-    ROLLING_OUT = auto()
-    BATCH_READY = auto()
-    READY_FOR_UPDATE = auto()
+    RUNNING = auto()
+    DRAINING = auto()
     UPDATING = auto()
     FAILED = auto()
     CLOSED = auto()
@@ -132,50 +131,57 @@ class _RolloutService:
         self._global_sample_count = global_count
 
         self._condition = asyncio.Condition()
+        self._ready_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
         self._state = _ServiceState.STARTING
         self._failure: BaseException | None = None
         self._backend: VllmBackend | None = None
-        self._step: _TrainingStep | None = None
-        self._producer_task: asyncio.Task[None] | None = None
+        self._current_step: _TrainingStep | None = None
+        self._current_step_task: asyncio.Task[_TrainingStep] | None = None
+        self._next_step_task: asyncio.Task[_TrainingStep] | None = None
         self._channel_task: asyncio.Task[None] | None = None
         self._pending_update: _PendingWeightUpdate | None = None
 
-        self._policy_version = config.initial_policy_version
+        self._active_policy_version = config.initial_policy_version
         self._next_batch_id = 0
         self._next_update_id = 0
+        self._last_updated_batch_id: int | None = None
         self._epoch = 0
         self._offset = 0
         self._order = self._make_order()
 
     async def ready(self) -> _ServiceInfo:
         """Initialize Workflow and vLLM once, then report service identity."""
-        if self._backend is None:
-            await self._initialize()
-        return _ServiceInfo(
-            state=self._state.name,
-            policy_version=self._policy_version,
-            world_size=self._train_world_size,
-        )
+        async with self._ready_lock:
+            self._raise_if_unusable()
+            if self._backend is None:
+                try:
+                    await self._initialize()
+                except BaseException as exc:
+                    failure = _first_exception(exc)
+                    await self._record_failure(failure)
+                    raise failure
+            return _ServiceInfo(
+                state=self._state.name,
+                policy_version=self._active_policy_version,
+                world_size=self._train_world_size,
+            )
 
     async def next_batch(self, request: _BatchRequest) -> TrainingBatch:
         self._validate_batch_request(request)
         async with self._condition:
             while True:
                 self._raise_if_unusable()
-                step = self._step
+                step = self._current_step
                 if step is None or request.step_id > step.batch_id:
                     await self._condition.wait()
                     continue
                 if request.step_id < step.batch_id:
                     raise ValueError("requested batch has already been released")
-                if len(step.samples) != self._global_sample_count:
-                    await self._condition.wait()
-                    continue
 
                 batch = self._slice_batch(step, request.rank)
                 step.delivered_ranks.add(request.rank)
-                if len(step.delivered_ranks) == self._train_world_size:
-                    self._state = _ServiceState.READY_FOR_UPDATE
                 self._condition.notify_all()
                 return batch
 
@@ -209,23 +215,62 @@ class _RolloutService:
         except BaseException as exc:
             await self._record_failure(exc)
             raise
-        await self._start_step()
+        await self._start_current_step()
 
     async def begin_weight_update(
         self, manifest: _WeightManifest
     ) -> _WeightUpdateTicket:
         async with self._condition:
             self._raise_if_unusable()
-            step = self._require_step()
-            if self._state is not _ServiceState.READY_FOR_UPDATE:
+            step = self._require_current_step()
+            if self._state is not _ServiceState.RUNNING:
+                raise RuntimeError("rollout service is not ready for a weight update")
+            if len(step.delivered_ranks) != self._train_world_size:
                 raise RuntimeError("all training ranks must fetch the batch first")
             if manifest.batch_id != step.batch_id:
                 raise ValueError("weight manifest does not match the current batch")
+            if self._pending_update is not None:
+                raise RuntimeError("a weight update is already pending")
+            expected_batch_id = (
+                0
+                if self._last_updated_batch_id is None
+                else self._last_updated_batch_id + 1
+            )
+            if step.batch_id != expected_batch_id:
+                raise RuntimeError("weight updates must follow batch order exactly")
+            self._state = _ServiceState.DRAINING
+            next_step_task = self._next_step_task
+
+        next_step: _TrainingStep | None = None
+        if self._config.rollout_mode == "async":
+            if next_step_task is None:
+                failure = RuntimeError("async rollout has no prefetched next batch")
+                await self._record_failure(failure)
+                raise failure
+            try:
+                next_step = await asyncio.shield(next_step_task)
+            except BaseException as exc:
+                failure = _first_exception(exc)
+                await self._record_failure(failure)
+                raise failure
+
+        async with self._condition:
+            self._raise_if_unusable()
+            if self._state is not _ServiceState.DRAINING:
+                raise RuntimeError("rollout service left the draining state")
+            if self._config.rollout_mode == "async":
+                if self._next_step_task is not next_step_task:
+                    raise RuntimeError("prefetched batch changed while draining")
+                assert next_step is not None
+                if next_step.batch_id != step.batch_id + 1:
+                    raise RuntimeError("prefetched batch is out of order")
+                if next_step.policy_version != self._active_policy_version:
+                    raise RuntimeError("prefetched batch has the wrong policy version")
             self._state = _ServiceState.UPDATING
             ticket = _WeightUpdateTicket(
                 update_id=self._next_update_id,
                 batch_id=step.batch_id,
-                new_policy_version=self._policy_version + 1,
+                new_policy_version=self._active_policy_version + 1,
             )
             self._next_update_id += 1
 
@@ -242,49 +287,101 @@ class _RolloutService:
         except BaseException as exc:
             await self._record_failure(exc)
             raise
-        self._pending_update = _PendingWeightUpdate(ticket, receive_task)
+        async with self._condition:
+            self._raise_if_unusable()
+            if self._state is not _ServiceState.UPDATING:
+                raise RuntimeError("rollout service left the updating state")
+            self._pending_update = _PendingWeightUpdate(ticket, receive_task)
         return ticket
 
     async def finish_weight_update(self, ticket: _WeightUpdateTicket) -> int:
-        pending = self._require_pending_update(ticket)
+        async with self._condition:
+            self._raise_if_unusable()
+            pending = self._require_pending_update(ticket)
+            if self._state is not _ServiceState.UPDATING:
+                raise RuntimeError("rollout service is not updating")
+            next_step = None
+            if self._config.rollout_mode == "async":
+                task = self._next_step_task
+                if task is None or not task.done() or task.cancelled():
+                    raise RuntimeError("prefetched batch is not ready for rotation")
+                next_step = task.result()
+
         try:
-            await self._require_backend().finish_weight_update(pending.receive_task)
+            await self._require_backend().finish_weight_update(
+                pending.receive_task,
+                new_policy_version=ticket.new_policy_version,
+            )
         except BaseException as exc:
             await self._record_failure(exc)
             raise
 
-        self._pending_update = None
-        self._policy_version = ticket.new_policy_version
-        self._next_batch_id += 1
-        await self._start_step()
-        return self._policy_version
+        async with self._condition:
+            self._raise_if_unusable()
+            self._require_pending_update(ticket)
+            self._pending_update = None
+            self._active_policy_version = ticket.new_policy_version
+            self._last_updated_batch_id = ticket.batch_id
+
+            if self._config.rollout_mode == "async":
+                assert next_step is not None
+                self._current_step = next_step
+                self._next_step_task = None
+                self._start_next_step_locked()
+            else:
+                self._current_step = None
+                self._start_current_step_locked()
+
+            self._state = _ServiceState.RUNNING
+            self._condition.notify_all()
+            return self._active_policy_version
 
     async def fail_weight_update(
         self, ticket: _WeightUpdateTicket, message: str
     ) -> None:
-        self._require_pending_update(ticket)
+        async with self._condition:
+            self._raise_if_unusable()
+            self._require_pending_update(ticket)
         failure = RuntimeError(f"trainer NCCL sender failed: {message}")
-        await self._require_backend().fail_weight_update(str(failure))
+        try:
+            await self._require_backend().fail_weight_update(str(failure))
+        except BaseException as exc:
+            cleanup_failure = _first_exception(exc)
+            failure.add_note(
+                "backend weight-update cleanup failed: "
+                f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+            )
+        async with self._condition:
+            self._pending_update = None
         await self._record_failure(failure)
 
     async def close(self) -> None:
-        async with self._condition:
-            if self._state is _ServiceState.CLOSED:
-                return
-            self._state = _ServiceState.CLOSED
-            producer = self._producer_task
-            channel = self._channel_task
-            self._condition.notify_all()
+        async with self._close_lock:
+            if self._close_task is None:
+                async with self._condition:
+                    self._state = _ServiceState.CLOSED
+                    tasks = tuple(
+                        task
+                        for task in (
+                            self._current_step_task,
+                            self._next_step_task,
+                            self._channel_task,
+                        )
+                        if task is not None
+                    )
+                    self._condition.notify_all()
+                self._close_task = asyncio.create_task(
+                    self._close_resources(tasks), name="chito-rollout-service-close"
+                )
+            close_task = self._close_task
+        await asyncio.shield(close_task)
 
-        for task in (producer, channel):
-            if task is not None and not task.done():
+    async def _close_resources(self, tasks: tuple[asyncio.Task[object], ...]) -> None:
+        for task in tasks:
+            if not task.done():
                 task.cancel()
-        for task in (producer, channel):
-            if task is not None:
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         try:
             await self._workflow.aclose()
@@ -308,65 +405,147 @@ class _RolloutService:
             top_p=self._config.top_p,
             engine_kwargs=options,
             seed=self._config.seed,
+            initial_policy_version=self._config.initial_policy_version,
         )
         if self._config.rollout_gpu_ids and (
             self._backend.inference_world_size != len(self._config.rollout_gpu_ids)
         ):
             raise ValueError("the vLLM parallel world size must match rollout_gpu_ids")
 
-    async def _start_step(self) -> None:
+    async def _start_current_step(self) -> None:
         async with self._condition:
             self._raise_if_unusable()
-            self._step = _TrainingStep(
-                batch_id=self._next_batch_id,
-                policy_version=self._policy_version,
-                samples=[],
-                delivered_ranks=set(),
-            )
-            self._state = _ServiceState.ROLLING_OUT
-            step = self._step
-            self._producer_task = asyncio.create_task(
-                self._fill_step(step),
-                name=f"chito-rollout-batch-{step.batch_id}",
-            )
+            if self._state is not _ServiceState.STARTING:
+                raise RuntimeError("initial rollout step was already started")
+            self._state = _ServiceState.RUNNING
+            self._start_current_step_locked()
             self._condition.notify_all()
 
-    async def _fill_step(self, step: _TrainingStep) -> None:
-        try:
-            while len(step.samples) < self._global_sample_count:
-                missing_groups = (
-                    self._global_sample_count - len(step.samples)
-                ) // self._config.group_size
-                concurrency = min(missing_groups, self._config.max_concurrent_groups)
-                items = [self._next_item() for _ in range(concurrency)]
-                async with asyncio.TaskGroup() as tasks:
-                    for item, item_id in items:
-                        tasks.create_task(self._process_item(step, item, item_id))
+    def _start_current_step_locked(self) -> None:
+        if self._current_step_task is not None:
+            raise RuntimeError("current rollout step is already running")
+        batch_id = self._take_batch_id()
+        self._current_step_task = asyncio.create_task(
+            self._build_and_publish_current(batch_id, self._active_policy_version),
+            name=f"chito-rollout-batch-{batch_id}",
+        )
 
+    def _start_next_step_locked(self) -> None:
+        if self._next_step_task is not None:
+            raise RuntimeError("next rollout step is already running")
+        batch_id = self._take_batch_id()
+        self._next_step_task = asyncio.create_task(
+            self._build_step_safely(batch_id, self._active_policy_version),
+            name=f"chito-rollout-prefetch-{batch_id}",
+        )
+
+    def _take_batch_id(self) -> int:
+        batch_id = self._next_batch_id
+        self._next_batch_id += 1
+        return batch_id
+
+    async def _build_and_publish_current(
+        self, batch_id: int, policy_version: int
+    ) -> _TrainingStep:
+        step = await self._build_step_safely(batch_id, policy_version)
+        try:
             async with self._condition:
-                if self._step is step and self._state is _ServiceState.ROLLING_OUT:
-                    self._state = _ServiceState.BATCH_READY
+                self._raise_if_unusable()
+                if self._current_step_task is not asyncio.current_task():
+                    raise RuntimeError(
+                        "current rollout task changed before publication"
+                    )
+                self._current_step = step
+                self._current_step_task = None
+                if self._config.rollout_mode == "async":
+                    self._start_next_step_locked()
                 self._condition.notify_all()
+            return step
+        except BaseException as exc:
+            failure = _first_exception(exc)
+            await self._record_failure(failure)
+            raise failure
+
+    async def _build_step_safely(
+        self, batch_id: int, policy_version: int
+    ) -> _TrainingStep:
+        try:
+            return await self._build_step(batch_id, policy_version)
         except asyncio.CancelledError:
             if self._state is not _ServiceState.CLOSED:
                 await self._record_failure(
-                    RuntimeError("rollout producer was cancelled")
+                    RuntimeError(f"rollout batch {batch_id} was cancelled")
                 )
+            raise
         except BaseException as exc:
-            await self._record_failure(_first_exception(exc))
+            failure = _first_exception(exc)
+            await self._record_failure(failure)
+            raise failure
+
+    async def _build_step(self, batch_id: int, policy_version: int) -> _TrainingStep:
+        target_group_count = self._global_sample_count // self._config.group_size
+        accepted_groups: list[tuple[TrainingSample, ...]] = []
+        in_flight: set[asyncio.Task[tuple[TrainingSample, ...] | None]] = set()
+        done: set[asyncio.Task[tuple[TrainingSample, ...] | None]] = set()
+
+        try:
+            while len(accepted_groups) < target_group_count:
+                while (
+                    len(in_flight) < self._config.max_concurrent_groups
+                    and len(accepted_groups) + len(in_flight) < target_group_count
+                ):
+                    item, item_id = self._next_item()
+                    in_flight.add(
+                        asyncio.create_task(
+                            self._process_item(item, item_id, policy_version)
+                        )
+                    )
+
+                done, in_flight = await asyncio.wait(
+                    in_flight, return_when=asyncio.FIRST_COMPLETED
+                )
+                first_failure: BaseException | None = None
+                completed_groups: list[tuple[TrainingSample, ...]] = []
+                for task in done:
+                    try:
+                        group_samples = task.result()
+                    except BaseException as exc:
+                        if first_failure is None:
+                            first_failure = _first_exception(exc)
+                    else:
+                        if group_samples is not None:
+                            completed_groups.append(group_samples)
+
+                if first_failure is not None:
+                    raise first_failure
+                accepted_groups.extend(completed_groups)
+                done = set()
+
+            samples = tuple(sample for group in accepted_groups for sample in group)
+            if len(samples) != self._global_sample_count:
+                raise RuntimeError("rollout batch has the wrong sample count")
+            return _TrainingStep(batch_id, policy_version, samples, set())
+        except BaseException:
+            siblings = done | in_flight
+            for task in siblings:
+                if not task.done():
+                    task.cancel()
+            if siblings:
+                await asyncio.gather(*siblings, return_exceptions=True)
+            raise
 
     async def _process_item(
-        self, step: _TrainingStep, item: object, item_id: str
-    ) -> None:
+        self, item: object, item_id: str, policy_version: int
+    ) -> tuple[TrainingSample, ...] | None:
         prompt = await self._workflow.prepare(item, item_id)
         if not isinstance(prompt, RolloutPrompt):
             raise TypeError("workflow.prepare must return RolloutPrompt")
 
-        group = await self._generate_group(prompt, step.policy_version)
+        group = await self._generate_group(prompt, policy_version)
         group = await self._workflow.postprocess(group)
         if group is None:
-            return
-        self._validate_group(group, prompt, step.policy_version)
+            return None
+        self._validate_group(group, prompt, policy_version)
 
         advantages = tuple(await self._workflow.compute_advantages(group))
         if len(advantages) != self._config.group_size:
@@ -380,6 +559,7 @@ class _RolloutService:
                 sample_index=sample.sample_index,
                 token_ids=sample.token_ids,
                 loss_mask=sample.loss_mask,
+                behavior_logprobs=sample.behavior_logprobs,
                 reward=float(sample.reward),
                 advantage=float(advantage),
                 policy_version=sample.policy_version,
@@ -387,11 +567,7 @@ class _RolloutService:
             )
             for sample, advantage in zip(group.samples, advantages, strict=True)
         )
-        async with self._condition:
-            if self._step is not step or self._state is not _ServiceState.ROLLING_OUT:
-                return
-            step.samples.extend(training_samples)
-            self._condition.notify_all()
+        return training_samples
 
     async def _generate_group(
         self, prompt: RolloutPrompt, policy_version: int
@@ -533,10 +709,10 @@ class _RolloutService:
             raise RuntimeError("rollout service is not initialized")
         return self._backend
 
-    def _require_step(self) -> _TrainingStep:
-        if self._step is None:
+    def _require_current_step(self) -> _TrainingStep:
+        if self._current_step is None:
             raise RuntimeError("rollout service has no active training step")
-        return self._step
+        return self._current_step
 
     def _require_pending_update(
         self, ticket: _WeightUpdateTicket
